@@ -4,9 +4,9 @@
 [![image](https://static.pepy.tech/badge/geoai-py)](https://pepy.tech/project/geoai-py)
 [![image](https://img.shields.io/conda/vn/conda-forge/geoai.svg)](https://anaconda.org/conda-forge/geoai)
 [![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/geoai.svg)](https://anaconda.org/conda-forge/geoai)
-[![Conda Recipe](https://img.shields.io/badge/recipe-geoai-green.svg)](https://github.com/conda-forge/geoai-py-feedstock)
+[![Conda Recipe](https://img.shields.io/badge/recipe-geoai-green.svg)](https://github.com/giswqs/geoai-py-feedstock)
 [![image](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![image](https://img.shields.io/badge/YouTube-Channel-red)](https://youtube.com/@giswqs)
+[![image](https://img.shields.io/badge/YouTube-Tutorials-red)](https://bit.ly/GeoAI-Tutorials)
 
 **A powerful Python package for integrating Artificial Intelligence with geospatial data analysis and visualization**
 
@@ -40,7 +40,7 @@ GeoAI bridges the gap between AI and geospatial analysis, providing tools for pr
 -   Integration with Meta's Segment Anything Model (SAM) for automatic feature extraction
 -   Specialized segmentation algorithms optimized for satellite and aerial imagery
 -   Streamlined workflows for segmenting buildings, roads, vegetation, and water bodies
--   Export capabilities to standard geospatial formats (GeoJSON, Shapefile, GeoPackage)
+-   Export capabilities to standard geospatial formats (GeoJSON, Shapefile, GeoPackage, GeoParquet)
 
 ### 🔍 Image Classification
 
@@ -85,6 +85,12 @@ Comprehensive documentation is available at [https://geoai.gishub.org](https://g
 -   Explanation of algorithms and models
 -   Best practices for geospatial AI
 
+## 📺 Video Tutorials
+
+Check out our [YouTube channel](https://bit.ly/GeoAI-Tutorials) for video tutorials on using GeoAI for geospatial data analysis and visualization.
+
+[![cover](https://github.com/user-attachments/assets/3cde9547-ab62-4d70-b23a-3e5ed27c7407)](https://bit.ly/GeoAI-Tutorials)
+
 ## 🤝 Contributing
 
 We welcome contributions of all kinds! See our [contributing guide](https://geoai.gishub.org/contributing) for ways to get started.
@@ -92,3 +98,7 @@ We welcome contributions of all kinds! See our [contributing guide](https://geoa
 ## 📄 License
 
 GeoAI is free and open source software, licensed under the MIT License.
+
+## 💖 Acknowledgment
+
+Some of the pre-trained models used in the geoai package are adapted from the [ArcGIS Living Atlas](https://livingatlas.arcgis.com/en/browse/?q=dlpk#d=2&q=dlpk). Credits to Esri for making these models available.

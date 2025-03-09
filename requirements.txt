@@ -11,8 +11,9 @@ planetary-computer
 pystac-client
 rasterio
 rioxarray
+scikit-image
 scikit-learn
-segment-geospatial
+# segment-geospatial
 torch
 torchgeo
 tqdm

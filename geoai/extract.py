@@ -1,52 +1,110 @@
+"""This module provides a dataset class for object extraction from raster data"""
+
+# Standard Library
 import os
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from shapely.geometry import Polygon, box
-import geopandas as gpd
-from tqdm import tqdm
 
+# Third-Party Libraries
 import cv2
-from torchgeo.datasets import NonGeoDataset
-from torchvision.models.detection import maskrcnn_resnet50_fpn
-import torchvision.transforms as T
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
 import rasterio
-from rasterio.windows import Window
-from rasterio.features import shapes
+import scipy.ndimage as ndimage
+import torch
 from huggingface_hub import hf_hub_download
-from .preprocess import get_raster_stats
+from rasterio.windows import Window
+from shapely.geometry import Polygon, box
+from tqdm import tqdm
+from torchvision.models.detection import (
+    maskrcnn_resnet50_fpn,
+    fasterrcnn_resnet50_fpn_v2,
+)
+
+# Local Imports
+from .utils import get_raster_stats
 
 
-class BuildingFootprintDataset(NonGeoDataset):
+try:
+    from torchgeo.datasets import NonGeoDataset
+except ImportError as e:
+    raise ImportError(
+        "Your torchgeo version is too old. Please upgrade to the latest version using 'pip install -U torchgeo'."
+    )
+
+
+class CustomDataset(NonGeoDataset):
     """
-    A TorchGeo dataset for building footprint extraction.
-    Using NonGeoDataset to avoid spatial indexing issues.
+    A TorchGeo dataset for object extraction with overlapping tiles support.
+
+    This dataset class creates overlapping image tiles for object detection,
+    ensuring complete coverage of the input raster including right and bottom edges.
+    It inherits from NonGeoDataset to avoid spatial indexing issues.
+
+    Attributes:
+        raster_path: Path to the input raster file.
+        chip_size: Size of image chips to extract (height, width).
+        overlap: Amount of overlap between adjacent tiles (0.0-1.0).
+        transforms: Transforms to apply to the image.
+        verbose: Whether to print detailed processing information.
+        stride_x: Horizontal stride between tiles based on overlap.
+        stride_y: Vertical stride between tiles based on overlap.
+        row_starts: Starting Y positions for each row of tiles.
+        col_starts: Starting X positions for each column of tiles.
+        crs: Coordinate reference system of the raster.
+        transform: Affine transform of the raster.
+        height: Height of the raster in pixels.
+        width: Width of the raster in pixels.
+        count: Number of bands in the raster.
+        bounds: Geographic bounds of the raster (west, south, east, north).
+        roi: Shapely box representing the region of interest.
+        rows: Number of rows of tiles.
+        cols: Number of columns of tiles.
+        raster_stats: Statistics of the raster.
     """
 
     def __init__(
-        self, raster_path, chip_size=(512, 512), transforms=None, verbose=False
+        self,
+        raster_path,
+        chip_size=(512, 512),
+        overlap=0.5,
+        transforms=None,
+        band_indexes=None,
+        verbose=False,
     ):
         """
-        Initialize the dataset.
+        Initialize the dataset with overlapping tiles.
 
         Args:
-            raster_path: Path to the input raster file
-            chip_size: Size of image chips to extract (height, width)
-            transforms: Transforms to apply to the image
-            verbose: Whether to print detailed processing information
+            raster_path: Path to the input raster file.
+            chip_size: Size of image chips to extract (height, width). Default is (512, 512).
+            overlap: Amount of overlap between adjacent tiles (0.0-1.0). Default is 0.5 (50%).
+            transforms: Transforms to apply to the image. Default is None.
+            band_indexes: List of band indexes to use. Default is None (use all bands).
+            verbose: Whether to print detailed processing information. Default is False.
+
+        Raises:
+            ValueError: If overlap is too high resulting in non-positive stride.
         """
         super().__init__()
 
         # Initialize parameters
         self.raster_path = raster_path
         self.chip_size = chip_size
+        self.overlap = overlap
         self.transforms = transforms
+        self.band_indexes = band_indexes
         self.verbose = verbose
-
-        # For tracking warnings about multi-band images
         self.warned_about_bands = False
 
-        # Open raster and get metadata
+        # Calculate stride based on overlap
+        self.stride_x = int(chip_size[1] * (1 - overlap))
+        self.stride_y = int(chip_size[0] * (1 - overlap))
+
+        if self.stride_x <= 0 or self.stride_y <= 0:
+            raise ValueError(
+                f"Overlap {overlap} is too high, resulting in non-positive stride"
+            )
+
         with rasterio.open(self.raster_path) as src:
             self.crs = src.crs
             self.transform = src.transform
@@ -57,43 +115,78 @@ class BuildingFootprintDataset(NonGeoDataset):
             # Define the bounds of the dataset
             west, south, east, north = src.bounds
             self.bounds = (west, south, east, north)
-
-            # Define the ROI for the dataset
             self.roi = box(*self.bounds)
 
-            # Calculate number of chips in each dimension
-            # Use ceil division to ensure we cover the entire image
-            self.rows = (self.height + self.chip_size[0] - 1) // self.chip_size[0]
-            self.cols = (self.width + self.chip_size[1] - 1) // self.chip_size[1]
+            # Calculate starting positions for each tile
+            self.row_starts = []
+            self.col_starts = []
+
+            # Normal row starts using stride
+            for r in range((self.height - 1) // self.stride_y):
+                self.row_starts.append(r * self.stride_y)
+
+            # Add a special last row that ensures we reach the bottom edge
+            if self.height > self.chip_size[0]:
+                self.row_starts.append(max(0, self.height - self.chip_size[0]))
+            else:
+                # If the image is smaller than chip size, just start at 0
+                if not self.row_starts:
+                    self.row_starts.append(0)
+
+            # Normal column starts using stride
+            for c in range((self.width - 1) // self.stride_x):
+                self.col_starts.append(c * self.stride_x)
+
+            # Add a special last column that ensures we reach the right edge
+            if self.width > self.chip_size[1]:
+                self.col_starts.append(max(0, self.width - self.chip_size[1]))
+            else:
+                # If the image is smaller than chip size, just start at 0
+                if not self.col_starts:
+                    self.col_starts.append(0)
+
+            # Update rows and cols based on actual starting positions
+            self.rows = len(self.row_starts)
+            self.cols = len(self.col_starts)
 
             print(
                 f"Dataset initialized with {self.rows} rows and {self.cols} columns of chips"
             )
             print(f"Image dimensions: {self.width} x {self.height} pixels")
             print(f"Chip size: {self.chip_size[1]} x {self.chip_size[0]} pixels")
+            print(
+                f"Overlap: {overlap*100}% (stride_x={self.stride_x}, stride_y={self.stride_y})"
+            )
             if src.crs:
                 print(f"CRS: {src.crs}")
 
-        # get raster stats
+        # Get raster stats
         self.raster_stats = get_raster_stats(raster_path, divide_by=255)
 
     def __getitem__(self, idx):
         """
         Get an image chip from the dataset by index.
 
+        Retrieves an image tile with the specified overlap pattern, ensuring
+        proper coverage of the entire raster including edges.
+
         Args:
-            idx: Index of the chip
+            idx: Index of the chip to retrieve.
 
         Returns:
-            Dict containing image tensor
+            dict: Dictionary containing:
+                - image: Image tensor.
+                - bbox: Geographic bounding box for the window.
+                - coords: Pixel coordinates as tensor [i, j].
+                - window_size: Window size as tensor [width, height].
         """
         # Convert flat index to grid position
         row = idx // self.cols
         col = idx % self.cols
 
-        # Calculate pixel coordinates
-        i = col * self.chip_size[1]
-        j = row * self.chip_size[0]
+        # Get pre-calculated starting positions
+        j = self.row_starts[row]
+        i = self.col_starts[col]
 
         # Read window from raster
         with rasterio.open(self.raster_path) as src:
@@ -109,7 +202,10 @@ class BuildingFootprintDataset(NonGeoDataset):
                 if not self.warned_about_bands and self.verbose:
                     print(f"Image has {image.shape[0]} bands, using first 3 bands only")
                     self.warned_about_bands = True
-                image = image[:3]
+                if self.band_indexes is not None:
+                    image = image[self.band_indexes]
+                else:
+                    image = image[:3]
             elif image.shape[0] < 3:
                 # If image has fewer than 3 bands, duplicate the last band to make 3
                 if not self.warned_about_bands and self.verbose:
@@ -160,22 +256,29 @@ class BuildingFootprintDataset(NonGeoDataset):
         }
 
     def __len__(self):
-        """Return the number of samples in the dataset."""
+        """
+        Return the number of samples in the dataset.
+
+        Returns:
+            int: Total number of tiles in the dataset.
+        """
         return self.rows * self.cols
 
 
-class BuildingFootprintExtractor:
+class ObjectDetector:
     """
-    Building footprint extraction using Mask R-CNN with TorchGeo.
+    Object extraction using Mask R-CNN with TorchGeo.
     """
 
-    def __init__(self, model_path=None, device=None):
+    def __init__(self, model_path=None, repo_id=None, model=None, device=None):
         """
-        Initialize the building footprint extractor.
+        Initialize the object extractor.
 
         Args:
-            model_path: Path to the .pth model file
-            device: Device to use for inference ('cuda:0', 'cpu', etc.)
+            model_path: Path to the .pth model file.
+            repo_id: Hugging Face repository ID for model download.
+            model: Pre-initialized model object (optional).
+            device: Device to use for inference ('cuda:0', 'cpu', etc.).
         """
         # Set device
         if device is None:
@@ -183,31 +286,36 @@ class BuildingFootprintExtractor:
         else:
             self.device = torch.device(device)
 
-        # Default parameters for building detection - these can be overridden in process_raster
+        # Default parameters for object detection - these can be overridden in process_raster
         self.chip_size = (512, 512)  # Size of image chips for processing
         self.overlap = 0.25  # Default overlap between tiles
         self.confidence_threshold = 0.5  # Default confidence threshold
         self.nms_iou_threshold = 0.5  # IoU threshold for non-maximum suppression
-        self.small_building_area = 100  # Minimum area in pixels to keep a building
+        self.min_object_area = 100  # Minimum area in pixels to keep an object
+        self.max_object_area = None  # Maximum area in pixels to keep an object
         self.mask_threshold = 0.5  # Threshold for mask binarization
         self.simplify_tolerance = 1.0  # Tolerance for polygon simplification
 
         # Initialize model
-        self.model = self._initialize_model()
+        self.model = self.initialize_model(model)
 
         # Download model if needed
-        if model_path is None:
-            model_path = self._download_model_from_hf()
+        if model_path is None or (not os.path.exists(model_path)):
+            model_path = self.download_model_from_hf(model_path, repo_id)
 
         # Load model weights
-        self._load_weights(model_path)
+        self.load_weights(model_path)
 
         # Set model to evaluation mode
         self.model.eval()
 
-    def _download_model_from_hf(self):
+    def download_model_from_hf(self, model_path=None, repo_id=None):
         """
-        Download the USA building footprints model from Hugging Face.
+        Download the object detection model from Hugging Face.
+
+        Args:
+            model_path: Path to the model file.
+            repo_id: Hugging Face repository ID.
 
         Returns:
             Path to the downloaded model file
@@ -217,17 +325,14 @@ class BuildingFootprintExtractor:
             print("Model path not specified, downloading from Hugging Face...")
 
             # Define the repository ID and model filename
-            repo_id = "giswqs/geoai"  # Update with your actual username/repo
-            filename = "building_footprints_usa.pth"
+            if repo_id is None:
+                repo_id = "giswqs/geoai"
 
-            # Ensure cache directory exists
-            # cache_dir = os.path.join(
-            #     os.path.expanduser("~"), ".cache", "building_footprints"
-            # )
-            # os.makedirs(cache_dir, exist_ok=True)
+            if model_path is None:
+                model_path = "building_footprints_usa.pth"
 
             # Download the model
-            model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            model_path = hf_hub_download(repo_id=repo_id, filename=model_path)
             print(f"Model downloaded to: {model_path}")
 
             return model_path
@@ -237,28 +342,36 @@ class BuildingFootprintExtractor:
             print("Please specify a local model path or ensure internet connectivity.")
             raise
 
-    def _initialize_model(self):
-        """Initialize Mask R-CNN model with ResNet50 backbone."""
-        # Standard image mean and std for pre-trained models
-        # Note: This would normally come from your config file
-        image_mean = [0.485, 0.456, 0.406]
-        image_std = [0.229, 0.224, 0.225]
+    def initialize_model(self, model):
+        """Initialize a deep learning model for object detection.
 
-        # Create model with explicit normalization parameters
-        model = maskrcnn_resnet50_fpn(
-            weights=None,
-            progress=False,
-            num_classes=2,  # Background + building
-            weights_backbone=None,
-            # These parameters ensure consistent normalization
-            image_mean=image_mean,
-            image_std=image_std,
-        )
+        Args:
+            model (torch.nn.Module): A pre-initialized model object.
+
+        Returns:
+            torch.nn.Module: A deep learning model for object detection.
+        """
+
+        if model is None:  # Initialize Mask R-CNN model with ResNet50 backbone.
+            # Standard image mean and std for pre-trained models
+            image_mean = [0.485, 0.456, 0.406]
+            image_std = [0.229, 0.224, 0.225]
+
+            # Create model with explicit normalization parameters
+            model = maskrcnn_resnet50_fpn(
+                weights=None,
+                progress=False,
+                num_classes=2,  # Background + object
+                weights_backbone=None,
+                # These parameters ensure consistent normalization
+                image_mean=image_mean,
+                image_std=image_std,
+            )
 
         model.to(self.device)
         return model
 
-    def _load_weights(self, model_path):
+    def load_weights(self, model_path):
         """
         Load weights from file with error handling for different formats.
 
@@ -300,7 +413,7 @@ class BuildingFootprintExtractor:
         except Exception as e:
             raise RuntimeError(f"Failed to load model: {e}")
 
-    def _mask_to_polygons(self, mask, **kwargs):
+    def mask_to_polygons(self, mask, **kwargs):
         """
         Convert binary mask to polygon contours using OpenCV.
 
@@ -309,7 +422,8 @@ class BuildingFootprintExtractor:
             **kwargs: Optional parameters:
                 simplify_tolerance: Tolerance for polygon simplification
                 mask_threshold: Threshold for mask binarization
-                small_building_area: Minimum area in pixels to keep a building
+                min_object_area: Minimum area in pixels to keep an object
+                max_object_area: Maximum area in pixels to keep an object
 
         Returns:
             List of polygons as lists of (x, y) coordinates
@@ -318,9 +432,8 @@ class BuildingFootprintExtractor:
         # Get parameters from kwargs or use instance defaults
         simplify_tolerance = kwargs.get("simplify_tolerance", self.simplify_tolerance)
         mask_threshold = kwargs.get("mask_threshold", self.mask_threshold)
-        small_building_area = kwargs.get(
-            "small_building_area", self.small_building_area
-        )
+        min_object_area = kwargs.get("min_object_area", self.min_object_area)
+        max_object_area = kwargs.get("max_object_area", self.max_object_area)
 
         # Ensure binary mask
         mask = (mask > mask_threshold).astype(np.uint8)
@@ -336,7 +449,14 @@ class BuildingFootprintExtractor:
         polygons = []
         for contour in contours:
             # Filter out too small contours
-            if contour.shape[0] < 3 or cv2.contourArea(contour) < small_building_area:
+            if contour.shape[0] < 3 or cv2.contourArea(contour) < min_object_area:
+                continue
+
+            # Filter out too large contours
+            if (
+                max_object_area is not None
+                and cv2.contourArea(contour) > max_object_area
+            ):
                 continue
 
             # Simplify contour if it has many points
@@ -350,7 +470,7 @@ class BuildingFootprintExtractor:
 
         return polygons
 
-    def _filter_overlapping_polygons(self, gdf, **kwargs):
+    def filter_overlapping_polygons(self, gdf, **kwargs):
         """
         Filter overlapping polygons using non-maximum suppression.
 
@@ -407,26 +527,26 @@ class BuildingFootprintExtractor:
 
         return gdf.iloc[keep_indices]
 
-    def filter_edge_buildings(self, gdf, raster_path, edge_buffer=10):
+    def filter_edge_objects(self, gdf, raster_path, edge_buffer=10):
         """
-        Filter out building detections that fall in padding/edge areas of the image.
+        Filter out object detections that fall in padding/edge areas of the image.
 
         Args:
-            gdf: GeoDataFrame with building footprint detections
+            gdf: GeoDataFrame with object detections
             raster_path: Path to the original raster file
             edge_buffer: Buffer in pixels to consider as edge region
 
         Returns:
-            GeoDataFrame with filtered building footprints
+            GeoDataFrame with filtered objects
         """
         import rasterio
         from shapely.geometry import box
 
-        # If no buildings detected, return empty GeoDataFrame
+        # If no objects detected, return empty GeoDataFrame
         if gdf is None or len(gdf) == 0:
             return gdf
 
-        print(f"Buildings before filtering: {len(gdf)}")
+        print(f"Objects before filtering: {len(gdf)}")
 
         with rasterio.open(raster_path) as src:
             # Get raster bounds
@@ -455,18 +575,18 @@ class BuildingFootprintExtractor:
             else:
                 inner_box = box(*inner_bounds)
 
-            # Filter out buildings that intersect with the edge of the image
+            # Filter out objects that intersect with the edge of the image
             filtered_gdf = gdf[gdf.intersects(inner_box)]
 
-            # Additional check for buildings that have >50% of their area outside the valid region
-            valid_buildings = []
+            # Additional check for objects that have >50% of their area outside the valid region
+            valid_objects = []
             for idx, row in filtered_gdf.iterrows():
                 if row.geometry.intersection(inner_box).area >= 0.5 * row.geometry.area:
-                    valid_buildings.append(idx)
+                    valid_objects.append(idx)
 
-            filtered_gdf = filtered_gdf.loc[valid_buildings]
+            filtered_gdf = filtered_gdf.loc[valid_objects]
 
-            print(f"Buildings after filtering: {len(filtered_gdf)}")
+            print(f"Objects after filtering: {len(filtered_gdf)}")
 
             return filtered_gdf
 
@@ -476,28 +596,30 @@ class BuildingFootprintExtractor:
         output_path=None,
         simplify_tolerance=None,
         mask_threshold=None,
-        small_building_area=None,
+        min_object_area=None,
+        max_object_area=None,
         nms_iou_threshold=None,
         regularize=True,
         angle_threshold=15,
         rectangularity_threshold=0.7,
     ):
         """
-        Convert a building mask GeoTIFF to vector polygons and save as GeoJSON.
+        Convert an object mask GeoTIFF to vector polygons and save as GeoJSON.
 
         Args:
-            mask_path: Path to the building masks GeoTIFF
+            mask_path: Path to the object masks GeoTIFF
             output_path: Path to save the output GeoJSON (default: mask_path with .geojson extension)
             simplify_tolerance: Tolerance for polygon simplification (default: self.simplify_tolerance)
             mask_threshold: Threshold for mask binarization (default: self.mask_threshold)
-            small_building_area: Minimum area in pixels to keep a building (default: self.small_building_area)
+            min_object_area: Minimum area in pixels to keep an object (default: self.min_object_area)
+            max_object_area: Minimum area in pixels to keep an object (default: self.max_object_area)
             nms_iou_threshold: IoU threshold for non-maximum suppression (default: self.nms_iou_threshold)
-            regularize: Whether to regularize buildings to right angles (default: True)
+            regularize: Whether to regularize objects to right angles (default: True)
             angle_threshold: Maximum deviation from 90 degrees for regularization (default: 15)
             rectangularity_threshold: Threshold for rectangle simplification (default: 0.7)
 
         Returns:
-            GeoDataFrame with building footprints
+            GeoDataFrame with objects
         """
         # Use class defaults if parameters not provided
         simplify_tolerance = (
@@ -508,10 +630,11 @@ class BuildingFootprintExtractor:
         mask_threshold = (
             mask_threshold if mask_threshold is not None else self.mask_threshold
         )
-        small_building_area = (
-            small_building_area
-            if small_building_area is not None
-            else self.small_building_area
+        min_object_area = (
+            min_object_area if min_object_area is not None else self.min_object_area
+        )
+        max_object_area = (
+            max_object_area if max_object_area is not None else self.max_object_area
         )
         nms_iou_threshold = (
             nms_iou_threshold
@@ -525,10 +648,11 @@ class BuildingFootprintExtractor:
 
         print(f"Converting mask to GeoJSON with parameters:")
         print(f"- Mask threshold: {mask_threshold}")
-        print(f"- Min building area: {small_building_area}")
+        print(f"- Min object area: {min_object_area}")
+        print(f"- Max object area: {max_object_area}")
         print(f"- Simplify tolerance: {simplify_tolerance}")
         print(f"- NMS IoU threshold: {nms_iou_threshold}")
-        print(f"- Regularize buildings: {regularize}")
+        print(f"- Regularize objects: {regularize}")
         if regularize:
             print(f"- Angle threshold: {angle_threshold}° from 90°")
             print(f"- Rectangularity threshold: {rectangularity_threshold*100}%")
@@ -558,7 +682,7 @@ class BuildingFootprintExtractor:
             )
 
             print(
-                f"Found {num_labels-1} potential buildings"
+                f"Found {num_labels-1} potential objects"
             )  # Subtract 1 for background
 
             # Create list to store polygons and confidence values
@@ -567,19 +691,23 @@ class BuildingFootprintExtractor:
 
             # Process each component (skip the first one which is background)
             for i in tqdm(range(1, num_labels)):
-                # Extract this building
+                # Extract this object
                 area = stats[i, cv2.CC_STAT_AREA]
 
                 # Skip if too small
-                if area < small_building_area:
+                if area < min_object_area:
                     continue
 
-                # Create a mask for this building
-                building_mask = (labels == i).astype(np.uint8)
+                # Skip if too large
+                if max_object_area is not None and area > max_object_area:
+                    continue
+
+                # Create a mask for this object
+                object_mask = (labels == i).astype(np.uint8)
 
                 # Find contours
                 contours, _ = cv2.findContours(
-                    building_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                 )
 
                 # Process each contour
@@ -627,17 +755,17 @@ class BuildingFootprintExtractor:
                 {
                     "geometry": all_polygons,
                     "confidence": all_confidences,
-                    "class": 1,  # Building class
+                    "class": 1,  # Object class
                 },
                 crs=crs,
             )
 
             # Apply non-maximum suppression to remove overlapping polygons
-            gdf = self._filter_overlapping_polygons(
+            gdf = self.filter_overlapping_polygons(
                 gdf, nms_iou_threshold=nms_iou_threshold
             )
 
-            print(f"Building count after NMS filtering: {len(gdf)}")
+            print(f"Object count after NMS filtering: {len(gdf)}")
 
             # Apply regularization if requested
             if regularize and len(gdf) > 0:
@@ -655,8 +783,8 @@ class BuildingFootprintExtractor:
                 # Use 10 pixels as minimum area in geographic units
                 min_geo_area = 10 * avg_pixel_area
 
-                # Regularize buildings
-                gdf = self.regularize_buildings(
+                # Regularize objects
+                gdf = self.regularize_objects(
                     gdf,
                     min_area=min_geo_area,
                     angle_threshold=angle_threshold,
@@ -666,7 +794,7 @@ class BuildingFootprintExtractor:
             # Save to file
             if output_path:
                 gdf.to_file(output_path)
-                print(f"Saved {len(gdf)} building footprints to {output_path}")
+                print(f"Saved {len(gdf)} objects to {output_path}")
 
             return gdf
 
@@ -678,28 +806,30 @@ class BuildingFootprintExtractor:
         batch_size=4,
         filter_edges=True,
         edge_buffer=20,
+        band_indexes=None,
         **kwargs,
     ):
         """
-        Process a raster file to extract building footprints with customizable parameters.
+        Process a raster file to extract objects with customizable parameters.
 
         Args:
             raster_path: Path to input raster file
             output_path: Path to output GeoJSON file (optional)
             batch_size: Batch size for processing
-            filter_edges: Whether to filter out buildings at the edges of the image
-            edge_buffer: Size of edge buffer in pixels to filter out buildings (if filter_edges=True)
+            filter_edges: Whether to filter out objects at the edges of the image
+            edge_buffer: Size of edge buffer in pixels to filter out objects (if filter_edges=True)
+            band_indexes: List of band indexes to use (if None, use all bands)
             **kwargs: Additional parameters:
                 confidence_threshold: Minimum confidence score to keep a detection (0.0-1.0)
                 overlap: Overlap between adjacent tiles (0.0-1.0)
                 chip_size: Size of image chips for processing (height, width)
                 nms_iou_threshold: IoU threshold for non-maximum suppression (0.0-1.0)
                 mask_threshold: Threshold for mask binarization (0.0-1.0)
-                small_building_area: Minimum area in pixels to keep a building
+                min_object_area: Minimum area in pixels to keep an object
                 simplify_tolerance: Tolerance for polygon simplification
 
         Returns:
-            GeoDataFrame with building footprints
+            GeoDataFrame with objects
         """
         # Get parameters from kwargs or use instance defaults
         confidence_threshold = kwargs.get(
@@ -709,9 +839,8 @@ class BuildingFootprintExtractor:
         chip_size = kwargs.get("chip_size", self.chip_size)
         nms_iou_threshold = kwargs.get("nms_iou_threshold", self.nms_iou_threshold)
         mask_threshold = kwargs.get("mask_threshold", self.mask_threshold)
-        small_building_area = kwargs.get(
-            "small_building_area", self.small_building_area
-        )
+        min_object_area = kwargs.get("min_object_area", self.min_object_area)
+        max_object_area = kwargs.get("max_object_area", self.max_object_area)
         simplify_tolerance = kwargs.get("simplify_tolerance", self.simplify_tolerance)
 
         # Print parameters being used
@@ -721,14 +850,20 @@ class BuildingFootprintExtractor:
         print(f"- Chip size: {chip_size}")
         print(f"- NMS IoU threshold: {nms_iou_threshold}")
         print(f"- Mask threshold: {mask_threshold}")
-        print(f"- Min building area: {small_building_area}")
+        print(f"- Min object area: {min_object_area}")
+        print(f"- Max object area: {max_object_area}")
         print(f"- Simplify tolerance: {simplify_tolerance}")
-        print(f"- Filter edge buildings: {filter_edges}")
+        print(f"- Filter edge objects: {filter_edges}")
         if filter_edges:
             print(f"- Edge buffer size: {edge_buffer} pixels")
 
         # Create dataset
-        dataset = BuildingFootprintDataset(raster_path=raster_path, chip_size=chip_size)
+        dataset = CustomDataset(
+            raster_path=raster_path,
+            chip_size=chip_size,
+            overlap=overlap,
+            band_indexes=band_indexes,
+        )
         self.raster_stats = dataset.raster_stats
 
         # Custom collate function to handle Shapely objects
@@ -848,11 +983,12 @@ class BuildingFootprintExtractor:
                     binary_mask = mask[0]  # Get binary mask
 
                     # Convert mask to polygon with custom parameters
-                    contours = self._mask_to_polygons(
+                    contours = self.mask_to_polygons(
                         binary_mask,
                         simplify_tolerance=simplify_tolerance,
                         mask_threshold=mask_threshold,
-                        small_building_area=small_building_area,
+                        min_object_area=min_object_area,
+                        max_object_area=max_object_area,
                     )
 
                     # Skip if no valid polygons
@@ -890,24 +1026,22 @@ class BuildingFootprintExtractor:
             {
                 "geometry": all_polygons,
                 "confidence": all_scores,
-                "class": 1,  # Building class
+                "class": 1,  # Object class
             },
             crs=dataset.crs,
         )
 
         # Remove overlapping polygons with custom threshold
-        gdf = self._filter_overlapping_polygons(
-            gdf, nms_iou_threshold=nms_iou_threshold
-        )
+        gdf = self.filter_overlapping_polygons(gdf, nms_iou_threshold=nms_iou_threshold)
 
-        # Filter edge buildings if requested
+        # Filter edge objects if requested
         if filter_edges:
-            gdf = self.filter_edge_buildings(gdf, raster_path, edge_buffer=edge_buffer)
+            gdf = self.filter_edge_objects(gdf, raster_path, edge_buffer=edge_buffer)
 
         # Save to file if requested
         if output_path:
             gdf.to_file(output_path, driver="GeoJSON")
-            print(f"Saved {len(gdf)} building footprints to {output_path}")
+            print(f"Saved {len(gdf)} objects to {output_path}")
 
         return gdf
 
@@ -915,7 +1049,7 @@ class BuildingFootprintExtractor:
         self, raster_path, output_path=None, batch_size=4, verbose=False, **kwargs
     ):
         """
-        Process a raster file to extract building footprint masks and save as GeoTIFF.
+        Process a raster file to extract object masks and save as GeoTIFF.
 
         Args:
             raster_path: Path to input raster file
@@ -937,6 +1071,7 @@ class BuildingFootprintExtractor:
         )
         chip_size = kwargs.get("chip_size", self.chip_size)
         mask_threshold = kwargs.get("mask_threshold", self.mask_threshold)
+        overlap = kwargs.get("overlap", self.overlap)
 
         # Set default output path if not provided
         if output_path is None:
@@ -949,8 +1084,11 @@ class BuildingFootprintExtractor:
         print(f"- Mask threshold: {mask_threshold}")
 
         # Create dataset
-        dataset = BuildingFootprintDataset(
-            raster_path=raster_path, chip_size=chip_size, verbose=verbose
+        dataset = CustomDataset(
+            raster_path=raster_path,
+            chip_size=chip_size,
+            overlap=overlap,
+            verbose=verbose,
         )
 
         # Store a flag to avoid repetitive messages
@@ -966,7 +1104,7 @@ class BuildingFootprintExtractor:
             output_profile = src.profile.copy()
             output_profile.update(
                 dtype=rasterio.uint8,
-                count=1,  # Single band for building mask
+                count=1,  # Single band for object mask
                 compress="lzw",
                 nodata=0,
             )
@@ -1138,10 +1276,10 @@ class BuildingFootprintExtractor:
                 # Write the final mask to the output file
                 dst.write(mask_array, 1)
 
-        print(f"Building masks saved to {output_path}")
+        print(f"Object masks saved to {output_path}")
         return output_path
 
-    def regularize_buildings(
+    def regularize_objects(
         self,
         gdf,
         min_area=10,
@@ -1150,17 +1288,17 @@ class BuildingFootprintExtractor:
         rectangularity_threshold=0.7,
     ):
         """
-        Regularize building footprints to enforce right angles and rectangular shapes.
+        Regularize objects to enforce right angles and rectangular shapes.
 
         Args:
-            gdf: GeoDataFrame with building footprints
-            min_area: Minimum area in square units to keep a building
+            gdf: GeoDataFrame with objects
+            min_area: Minimum area in square units to keep an object
             angle_threshold: Maximum deviation from 90 degrees to consider an angle as orthogonal (degrees)
-            orthogonality_threshold: Percentage of angles that must be orthogonal for a building to be regularized
-            rectangularity_threshold: Minimum area ratio to building's oriented bounding box for rectangular simplification
+            orthogonality_threshold: Percentage of angles that must be orthogonal for an object to be regularized
+            rectangularity_threshold: Minimum area ratio to Object's oriented bounding box for rectangular simplification
 
         Returns:
-            GeoDataFrame with regularized building footprints
+            GeoDataFrame with regularized objects
         """
         import numpy as np
         from shapely.geometry import Polygon, MultiPolygon, box
@@ -1275,10 +1413,10 @@ class BuildingFootprintExtractor:
             return rect
 
         if gdf is None or len(gdf) == 0:
-            print("No buildings to regularize")
+            print("No Objects to regularize")
             return gdf
 
-        print(f"Regularizing {len(gdf)} building footprints...")
+        print(f"Regularizing {len(gdf)} objects...")
         print(f"- Angle threshold: {angle_threshold}° from 90°")
         print(f"- Min orthogonality: {orthogonality_threshold*100}% of angles")
         print(
@@ -1289,11 +1427,11 @@ class BuildingFootprintExtractor:
         result_gdf = gdf.copy()
 
         # Track statistics
-        total_buildings = len(gdf)
+        total_objects = len(gdf)
         regularized_count = 0
         rectangularized_count = 0
 
-        # Process each building
+        # Process each Object
         for idx, row in tqdm(gdf.iterrows(), total=len(gdf)):
             geom = row.geometry
 
@@ -1308,7 +1446,7 @@ class BuildingFootprintExtractor:
                     continue
                 geom = list(geom.geoms)[np.argmax(areas)]
 
-            # Filter out tiny buildings
+            # Filter out tiny Objects
             if geom.area < min_area:
                 continue
 
@@ -1325,33 +1463,33 @@ class BuildingFootprintExtractor:
 
             # Decide how to regularize
             if rectangularity >= rectangularity_threshold:
-                # Building is already quite rectangular, simplify to a rectangle
+                # Object is already quite rectangular, simplify to a rectangle
                 result_gdf.at[idx, "geometry"] = oriented_box
                 result_gdf.at[idx, "regularized"] = "rectangle"
                 rectangularized_count += 1
             elif orthogonality >= orthogonality_threshold:
-                # Building has many orthogonal angles but isn't rectangular
+                # Object has many orthogonal angles but isn't rectangular
                 # Could implement more sophisticated regularization here
                 # For now, we'll still use the oriented rectangle
                 result_gdf.at[idx, "geometry"] = oriented_box
                 result_gdf.at[idx, "regularized"] = "orthogonal"
                 regularized_count += 1
             else:
-                # Building doesn't have clear orthogonal structure
+                # Object doesn't have clear orthogonal structure
                 # Keep original but flag as unmodified
                 result_gdf.at[idx, "regularized"] = "original"
 
         # Report statistics
         print(f"Regularization completed:")
-        print(f"- Total buildings: {total_buildings}")
+        print(f"- Total objects: {total_objects}")
         print(
-            f"- Rectangular buildings: {rectangularized_count} ({rectangularized_count/total_buildings*100:.1f}%)"
+            f"- Rectangular objects: {rectangularized_count} ({rectangularized_count/total_objects*100:.1f}%)"
         )
         print(
-            f"- Other regularized buildings: {regularized_count} ({regularized_count/total_buildings*100:.1f}%)"
+            f"- Other regularized objects: {regularized_count} ({regularized_count/total_objects*100:.1f}%)"
         )
         print(
-            f"- Unmodified buildings: {total_buildings-rectangularized_count-regularized_count} ({(total_buildings-rectangularized_count-regularized_count)/total_buildings*100:.1f}%)"
+            f"- Unmodified objects: {total_objects-rectangularized_count-regularized_count} ({(total_objects-rectangularized_count-regularized_count)/total_objects*100:.1f}%)"
         )
 
         return result_gdf
@@ -1360,14 +1498,14 @@ class BuildingFootprintExtractor:
         self, raster_path, gdf=None, output_path=None, figsize=(12, 12)
     ):
         """
-        Visualize building detection results with proper coordinate transformation.
+        Visualize object detection results with proper coordinate transformation.
 
-        This function displays building footprints on top of the raster image,
+        This function displays objects on top of the raster image,
         ensuring proper alignment between the GeoDataFrame polygons and the image.
 
         Args:
             raster_path: Path to input raster
-            gdf: GeoDataFrame with building polygons (optional)
+            gdf: GeoDataFrame with object polygons (optional)
             output_path: Path to save visualization (optional)
             figsize: Figure size (width, height) in inches
 
@@ -1384,7 +1522,7 @@ class BuildingFootprintExtractor:
             gdf = self.process_raster(raster_path)
 
         if gdf is None or len(gdf) == 0:
-            print("No buildings to visualize")
+            print("No objects to visualize")
             return False
 
         # Check if confidence column exists in the GeoDataFrame
@@ -1525,7 +1663,7 @@ class BuildingFootprintExtractor:
                 print(f"Unsupported geometry type: {geometry.geom_type}")
                 return None
 
-        # Plot each building footprint
+        # Plot each object
         for idx, row in gdf.iterrows():
             try:
                 # Convert polygon to pixel coordinates
@@ -1587,7 +1725,7 @@ class BuildingFootprintExtractor:
         # Remove axes
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title(f"Building Footprints (Found: {len(gdf)})")
+        ax.set_title(f"objects (Found: {len(gdf)})")
 
         # Save if requested
         if output_path:
@@ -1597,21 +1735,21 @@ class BuildingFootprintExtractor:
 
         plt.close()
 
-        # Create a simpler visualization focused just on a subset of buildings
+        # Create a simpler visualization focused just on a subset of objects
         if len(gdf) > 0:
             plt.figure(figsize=figsize)
             ax = plt.gca()
 
             # Choose a subset of the image to show
             with rasterio.open(raster_path) as src:
-                # Get centroid of first building
+                # Get centroid of first object
                 sample_geom = gdf.iloc[0].geometry
                 centroid = sample_geom.centroid
 
                 # Convert to pixel coordinates
                 center_x, center_y = ~src.transform * (centroid.x, centroid.y)
 
-                # Define a window around this building
+                # Define a window around this object
                 window_size = 500  # pixels
                 window = rasterio.windows.Window(
                     max(0, int(center_x - window_size / 2)),
@@ -1648,7 +1786,7 @@ class BuildingFootprintExtractor:
                 window_bounds = rasterio.windows.bounds(window, src.transform)
                 window_box = box(*window_bounds)
 
-                # Filter buildings that intersect with this window
+                # Filter objects that intersect with this window
                 visible_gdf = gdf[gdf.intersects(window_box)]
 
                 # Set up colors for sample view if confidence data exists
@@ -1670,7 +1808,7 @@ class BuildingFootprintExtractor:
                     except Exception as e:
                         print(f"Error setting up sample confidence visualization: {e}")
 
-                # Plot building footprints in sample view
+                # Plot objects in sample view
                 for idx, row in visible_gdf.iterrows():
                     try:
                         # Get window-relative pixel coordinates
@@ -1745,9 +1883,7 @@ class BuildingFootprintExtractor:
                         print(f"Error plotting polygon in sample view: {e}")
 
                 # Set title
-                ax.set_title(
-                    f"Sample Area - Building Footprints (Showing: {len(visible_gdf)})"
-                )
+                ax.set_title(f"Sample Area - objects (Showing: {len(visible_gdf)})")
 
                 # Remove axes
                 ax.set_xticks([])
@@ -1763,3 +1899,454 @@ class BuildingFootprintExtractor:
                     plt.tight_layout()
                     plt.savefig(sample_output, dpi=300, bbox_inches="tight")
                     print(f"Sample visualization saved to {sample_output}")
+
+    def generate_masks(
+        self,
+        raster_path,
+        output_path=None,
+        confidence_threshold=None,
+        mask_threshold=None,
+        min_object_area=10,
+        max_object_area=float("inf"),
+        overlap=0.25,
+        batch_size=4,
+        band_indexes=None,
+        verbose=False,
+        **kwargs,
+    ):
+        """
+        Save masks with confidence values as a multi-band GeoTIFF.
+
+        Objects with area smaller than min_object_area or larger than max_object_area
+        will be filtered out.
+
+        Args:
+            raster_path: Path to input raster
+            output_path: Path for output GeoTIFF
+            confidence_threshold: Minimum confidence score (0.0-1.0)
+            mask_threshold: Threshold for mask binarization (0.0-1.0)
+            min_object_area: Minimum area (in pixels) for an object to be included
+            max_object_area: Maximum area (in pixels) for an object to be included
+            overlap: Overlap between tiles (0.0-1.0)
+            batch_size: Batch size for processing
+            band_indexes: List of band indexes to use (default: all bands)
+            verbose: Whether to print detailed processing information
+
+        Returns:
+            Path to the saved GeoTIFF
+        """
+        # Use provided thresholds or fall back to instance defaults
+        if confidence_threshold is None:
+            confidence_threshold = self.confidence_threshold
+        if mask_threshold is None:
+            mask_threshold = self.mask_threshold
+
+        chip_size = kwargs.get("chip_size", self.chip_size)
+
+        # Default output path
+        if output_path is None:
+            output_path = os.path.splitext(raster_path)[0] + "_masks_conf.tif"
+
+        # Process the raster to get individual masks with confidence
+        with rasterio.open(raster_path) as src:
+            # Create dataset with the specified overlap
+            dataset = CustomDataset(
+                raster_path=raster_path,
+                chip_size=chip_size,
+                overlap=overlap,
+                band_indexes=band_indexes,
+                verbose=verbose,
+            )
+
+            # Create output profile
+            output_profile = src.profile.copy()
+            output_profile.update(
+                dtype=rasterio.uint8,
+                count=2,  # Two bands: mask and confidence
+                compress="lzw",
+                nodata=0,
+            )
+
+            # Initialize mask and confidence arrays
+            mask_array = np.zeros((src.height, src.width), dtype=np.uint8)
+            conf_array = np.zeros((src.height, src.width), dtype=np.uint8)
+
+            # Define custom collate function to handle Shapely objects
+            def custom_collate(batch):
+                """
+                Custom collate function that handles Shapely geometries
+                by keeping them as Python objects rather than trying to collate them.
+                """
+                elem = batch[0]
+                if isinstance(elem, dict):
+                    result = {}
+                    for key in elem:
+                        if key == "bbox":
+                            # Don't collate shapely objects, keep as list
+                            result[key] = [d[key] for d in batch]
+                        else:
+                            # For tensors and other collatable types
+                            try:
+                                result[key] = (
+                                    torch.utils.data._utils.collate.default_collate(
+                                        [d[key] for d in batch]
+                                    )
+                                )
+                            except TypeError:
+                                # Fall back to list for non-collatable types
+                                result[key] = [d[key] for d in batch]
+                    return result
+                else:
+                    # Default collate for non-dict types
+                    return torch.utils.data._utils.collate.default_collate(batch)
+
+            # Create dataloader with custom collate function
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=custom_collate,
+            )
+
+            # Process batches
+            print(f"Processing raster with {len(dataloader)} batches")
+            for batch in tqdm(dataloader):
+                # Move images to device
+                images = batch["image"].to(self.device)
+                coords = batch["coords"]  # Tensor of shape [batch_size, 2]
+
+                # Run inference
+                with torch.no_grad():
+                    predictions = self.model(images)
+
+                # Process predictions
+                for idx, prediction in enumerate(predictions):
+                    masks = prediction["masks"].cpu().numpy()
+                    scores = prediction["scores"].cpu().numpy()
+
+                    # Filter by confidence threshold
+                    valid_indices = scores >= confidence_threshold
+                    masks = masks[valid_indices]
+                    scores = scores[valid_indices]
+
+                    # Skip if no valid predictions
+                    if len(masks) == 0:
+                        continue
+
+                    # Get window coordinates
+                    i, j = coords[idx].cpu().numpy()
+
+                    # Process each mask
+                    for mask_idx, mask in enumerate(masks):
+                        # Convert to binary mask
+                        binary_mask = (mask[0] > mask_threshold).astype(np.uint8) * 255
+
+                        # Check object area - calculate number of pixels in the mask
+                        object_area = np.sum(binary_mask > 0)
+
+                        # Skip objects that don't meet area criteria
+                        if (
+                            object_area < min_object_area
+                            or object_area > max_object_area
+                        ):
+                            if verbose:
+                                print(
+                                    f"Filtering out object with area {object_area} pixels"
+                                )
+                            continue
+
+                        conf_value = int(scores[mask_idx] * 255)  # Scale to 0-255
+
+                        # Update the mask and confidence arrays
+                        h, w = binary_mask.shape
+                        valid_h = min(h, src.height - j)
+                        valid_w = min(w, src.width - i)
+
+                        if valid_h > 0 and valid_w > 0:
+                            # Use maximum for overlapping regions in the mask
+                            mask_array[j : j + valid_h, i : i + valid_w] = np.maximum(
+                                mask_array[j : j + valid_h, i : i + valid_w],
+                                binary_mask[:valid_h, :valid_w],
+                            )
+
+                            # For confidence, only update where mask is positive
+                            # and confidence is higher than existing
+                            mask_region = binary_mask[:valid_h, :valid_w] > 0
+                            if np.any(mask_region):
+                                # Only update where mask is positive and new confidence is higher
+                                current_conf = conf_array[
+                                    j : j + valid_h, i : i + valid_w
+                                ]
+
+                                # Where to update confidence (mask positive & higher confidence)
+                                update_mask = np.logical_and(
+                                    mask_region,
+                                    np.logical_or(
+                                        current_conf == 0, current_conf < conf_value
+                                    ),
+                                )
+
+                                if np.any(update_mask):
+                                    conf_array[j : j + valid_h, i : i + valid_w][
+                                        update_mask
+                                    ] = conf_value
+
+            # Write to GeoTIFF
+            with rasterio.open(output_path, "w", **output_profile) as dst:
+                dst.write(mask_array, 1)
+                dst.write(conf_array, 2)
+
+            print(f"Masks with confidence values saved to {output_path}")
+            return output_path
+
+    def vectorize_masks(
+        self,
+        masks_path,
+        output_path=None,
+        confidence_threshold=0.5,
+        min_object_area=100,
+        max_object_size=None,
+        **kwargs,
+    ):
+        """
+        Convert masks with confidence to vector polygons.
+
+        Args:
+            masks_path: Path to masks GeoTIFF with confidence band.
+            output_path: Path for output GeoJSON.
+            confidence_threshold: Minimum confidence score (0.0-1.0). Default: 0.5
+            min_object_area: Minimum area in pixels to keep an object. Default: 100
+            max_object_size: Maximum area in pixels to keep an object. Default: None
+            **kwargs: Additional parameters
+
+        Returns:
+            GeoDataFrame with car detections and confidence values
+        """
+
+        print(f"Processing masks from: {masks_path}")
+
+        with rasterio.open(masks_path) as src:
+            # Read mask and confidence bands
+            mask_data = src.read(1)
+            conf_data = src.read(2)
+            transform = src.transform
+            crs = src.crs
+
+            # Convert to binary mask
+            binary_mask = mask_data > 0
+
+            # Find connected components
+            labeled_mask, num_features = ndimage.label(binary_mask)
+            print(f"Found {num_features} connected components")
+
+            # Process each component
+            car_polygons = []
+            car_confidences = []
+
+            # Add progress bar
+            for label in tqdm(range(1, num_features + 1), desc="Processing components"):
+                # Create mask for this component
+                component_mask = (labeled_mask == label).astype(np.uint8)
+
+                # Get confidence value (mean of non-zero values in this region)
+                conf_region = conf_data[component_mask > 0]
+                if len(conf_region) > 0:
+                    confidence = (
+                        np.mean(conf_region) / 255.0
+                    )  # Convert back to 0-1 range
+                else:
+                    confidence = 0.0
+
+                # Skip if confidence is below threshold
+                if confidence < confidence_threshold:
+                    continue
+
+                # Find contours
+                contours, _ = cv2.findContours(
+                    component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+
+                for contour in contours:
+                    # Filter by size
+                    area = cv2.contourArea(contour)
+                    if area < min_object_area:
+                        continue
+
+                    if max_object_size is not None:
+                        if area > max_object_size:
+                            continue
+
+                    # Get minimum area rectangle
+                    rect = cv2.minAreaRect(contour)
+                    box_points = cv2.boxPoints(rect)
+
+                    # Convert to geographic coordinates
+                    geo_points = []
+                    for x, y in box_points:
+                        gx, gy = transform * (x, y)
+                        geo_points.append((gx, gy))
+
+                    # Create polygon
+                    poly = Polygon(geo_points)
+
+                    # Add to lists
+                    car_polygons.append(poly)
+                    car_confidences.append(confidence)
+
+            # Create GeoDataFrame
+            if car_polygons:
+                gdf = gpd.GeoDataFrame(
+                    {
+                        "geometry": car_polygons,
+                        "confidence": car_confidences,
+                        "class": [1] * len(car_polygons),
+                    },
+                    crs=crs,
+                )
+
+                # Save to file if requested
+                if output_path:
+                    gdf.to_file(output_path, driver="GeoJSON")
+                    print(f"Saved {len(gdf)} objects with confidence to {output_path}")
+
+                return gdf
+            else:
+                print("No valid car polygons found")
+                return None
+
+
+class BuildingFootprintExtractor(ObjectDetector):
+    """
+    Building footprint extraction using a pre-trained Mask R-CNN model.
+
+    This class extends the
+    `ObjectDetector` class with additional methods for building footprint extraction."
+    """
+
+    def __init__(
+        self,
+        model_path="building_footprints_usa.pth",
+        repo_id=None,
+        model=None,
+        device=None,
+    ):
+        """
+        Initialize the object extractor.
+
+        Args:
+            model_path: Path to the .pth model file.
+            repo_id: Repo ID for loading models from the Hub.
+            model: Custom model to use for inference.
+            device: Device to use for inference ('cuda:0', 'cpu', etc.).
+        """
+        super().__init__(
+            model_path=model_path, repo_id=repo_id, model=model, device=device
+        )
+
+    def regularize_buildings(
+        self,
+        gdf,
+        min_area=10,
+        angle_threshold=15,
+        orthogonality_threshold=0.3,
+        rectangularity_threshold=0.7,
+    ):
+        """
+        Regularize building footprints to enforce right angles and rectangular shapes.
+
+        Args:
+            gdf: GeoDataFrame with building footprints
+            min_area: Minimum area in square units to keep a building
+            angle_threshold: Maximum deviation from 90 degrees to consider an angle as orthogonal (degrees)
+            orthogonality_threshold: Percentage of angles that must be orthogonal for a building to be regularized
+            rectangularity_threshold: Minimum area ratio to building's oriented bounding box for rectangular simplification
+
+        Returns:
+            GeoDataFrame with regularized building footprints
+        """
+        return self.regularize_objects(
+            gdf,
+            min_area=min_area,
+            angle_threshold=angle_threshold,
+            orthogonality_threshold=orthogonality_threshold,
+            rectangularity_threshold=rectangularity_threshold,
+        )
+
+
+class CarDetector(ObjectDetector):
+    """
+    Car detection using a pre-trained Mask R-CNN model.
+
+    This class extends the `ObjectDetector` class with additional methods for car detection.
+    """
+
+    def __init__(
+        self, model_path="car_detection_usa.pth", repo_id=None, model=None, device=None
+    ):
+        """
+        Initialize the object extractor.
+
+        Args:
+            model_path: Path to the .pth model file.
+            repo_id: Repo ID for loading models from the Hub.
+            model: Custom model to use for inference.
+            device: Device to use for inference ('cuda:0', 'cpu', etc.).
+        """
+        super().__init__(
+            model_path=model_path, repo_id=repo_id, model=model, device=device
+        )
+
+
+class ShipDetector(ObjectDetector):
+    """
+    Ship detection using a pre-trained Mask R-CNN model.
+
+    This class extends the
+    `ObjectDetector` class with additional methods for ship detection."
+    """
+
+    def __init__(
+        self, model_path="ship_detection.pth", repo_id=None, model=None, device=None
+    ):
+        """
+        Initialize the object extractor.
+
+        Args:
+            model_path: Path to the .pth model file.
+            repo_id: Repo ID for loading models from the Hub.
+            model: Custom model to use for inference.
+            device: Device to use for inference ('cuda:0', 'cpu', etc.).
+        """
+        super().__init__(
+            model_path=model_path, repo_id=repo_id, model=model, device=device
+        )
+
+
+class SolarPanelDetector(ObjectDetector):
+    """
+    Solar panel detection using a pre-trained Mask R-CNN model.
+
+    This class extends the
+    `ObjectDetector` class with additional methods for solar panel detection."
+    """
+
+    def __init__(
+        self,
+        model_path="solar_panel_detection.pth",
+        repo_id=None,
+        model=None,
+        device=None,
+    ):
+        """
+        Initialize the object extractor.
+
+        Args:
+            model_path: Path to the .pth model file.
+            repo_id: Repo ID for loading models from the Hub.
+            model: Custom model to use for inference.
+            device: Device to use for inference ('cuda:0', 'cpu', etc.).
+        """
+        super().__init__(
+            model_path=model_path, repo_id=repo_id, model=model, device=device
+        )

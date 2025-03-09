@@ -1,26 +1,1253 @@
+"""The utils module contains common functions and classes used by the other modules."""
+
+# Standard Library
 import json
 import math
 import os
-from PIL import Image
-from pathlib import Path
-import requests
 import warnings
 import xml.etree.ElementTree as ET
-import numpy as np
-import rasterio
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Third-Party Libraries
+import cv2
 import geopandas as gpd
+import leafmap
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-from rasterio.windows import Window
+import rasterio
+import requests
+import rioxarray as rxr
+import torch
+import torchgeo
+import xarray as xr
+from PIL import Image
 from rasterio import features
 from rasterio.plot import show
-from shapely.geometry import box, shape, mapping, Polygon
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from torchvision.transforms import RandomRotation
+from rasterio.windows import Window
 from shapely.affinity import rotate
-import torchgeo
-import torch
-import cv2
+from shapely.geometry import (
+    MultiPolygon,
+    Polygon,
+    box,
+    mapping,
+    shape,
+)
+from torchvision.transforms import RandomRotation
+from tqdm import tqdm
+
+
+try:
+    from torchgeo.datasets import RasterDataset, unbind_samples
+except ImportError as e:
+    raise ImportError(
+        "Your torchgeo version is too old. Please upgrade to the latest version using 'pip install -U torchgeo'."
+    )
+
+
+def view_raster(
+    source: str,
+    indexes: Optional[int] = None,
+    colormap: Optional[str] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    nodata: Optional[float] = None,
+    attribution: Optional[str] = None,
+    layer_name: Optional[str] = "Raster",
+    layer_index: Optional[int] = None,
+    zoom_to_layer: Optional[bool] = True,
+    visible: Optional[bool] = True,
+    opacity: Optional[float] = 1.0,
+    array_args: Optional[Dict] = {},
+    client_args: Optional[Dict] = {"cors_all": False},
+    basemap: Optional[str] = "OpenStreetMap",
+    basemap_args: Optional[Dict] = None,
+    backend: Optional[str] = "folium",
+    **kwargs,
+):
+    """
+    Visualize a raster using leafmap.
+
+    Args:
+        source (str): The source of the raster.
+        indexes (Optional[int], optional): The band indexes to visualize. Defaults to None.
+        colormap (Optional[str], optional): The colormap to apply. Defaults to None.
+        vmin (Optional[float], optional): The minimum value for colormap scaling. Defaults to None.
+        vmax (Optional[float], optional): The maximum value for colormap scaling. Defaults to None.
+        nodata (Optional[float], optional): The nodata value. Defaults to None.
+        attribution (Optional[str], optional): The attribution for the raster. Defaults to None.
+        layer_name (Optional[str], optional): The name of the layer. Defaults to "Raster".
+        layer_index (Optional[int], optional): The index of the layer. Defaults to None.
+        zoom_to_layer (Optional[bool], optional): Whether to zoom to the layer. Defaults to True.
+        visible (Optional[bool], optional): Whether the layer is visible. Defaults to True.
+        opacity (Optional[float], optional): The opacity of the layer. Defaults to 1.0.
+        array_args (Optional[Dict], optional): Additional arguments for array processing. Defaults to {}.
+        client_args (Optional[Dict], optional): Additional arguments for the client. Defaults to {"cors_all": False}.
+        basemap (Optional[str], optional): The basemap to use. Defaults to "OpenStreetMap".
+        basemap_args (Optional[Dict], optional): Additional arguments for the basemap. Defaults to None.
+        **kwargs (Any): Additional keyword arguments.
+
+    Returns:
+        leafmap.Map: The map object with the raster layer added.
+    """
+
+    if backend == "folium":
+        import leafmap.foliumap as leafmap
+    else:
+        import leafmap.leafmap as leafmap
+
+    if basemap_args is None:
+        basemap_args = {}
+
+    m = leafmap.Map()
+
+    if isinstance(basemap, str):
+        if basemap.lower().endswith(".tif"):
+            if basemap.lower().startswith("http"):
+                if "name" not in basemap_args:
+                    basemap_args["name"] = "Basemap"
+                m.add_cog_layer(basemap, **basemap_args)
+            else:
+                if "layer_name" not in basemap_args:
+                    basemap_args["layer_name"] = "Basemap"
+                m.add_raster(basemap, **basemap_args)
+    else:
+        m.add_basemap(basemap, **basemap_args)
+
+    if isinstance(source, dict):
+        source = dict_to_image(source)
+
+    if (
+        isinstance(source, str)
+        and source.lower().endswith(".tif")
+        and source.startswith("http")
+    ):
+        if indexes is not None:
+            kwargs["bidx"] = indexes
+        if colormap is not None:
+            kwargs["colormap_name"] = colormap
+        if attribution is None:
+            attribution = "TiTiler"
+
+        m.add_cog_layer(
+            source,
+            name=layer_name,
+            opacity=opacity,
+            attribution=attribution,
+            zoom_to_layer=zoom_to_layer,
+            **kwargs,
+        )
+    else:
+        m.add_raster(
+            source=source,
+            indexes=indexes,
+            colormap=colormap,
+            vmin=vmin,
+            vmax=vmax,
+            nodata=nodata,
+            attribution=attribution,
+            layer_name=layer_name,
+            layer_index=layer_index,
+            zoom_to_layer=zoom_to_layer,
+            visible=visible,
+            opacity=opacity,
+            array_args=array_args,
+            client_args=client_args,
+            **kwargs,
+        )
+    return m
+
+
+def view_image(
+    image: Union[np.ndarray, torch.Tensor],
+    transpose: bool = False,
+    bdx: Optional[int] = None,
+    scale_factor: float = 1.0,
+    figsize: Tuple[int, int] = (10, 5),
+    axis_off: bool = True,
+    title: Optional[str] = None,
+    **kwargs: Any,
+) -> None:
+    """
+    Visualize an image using matplotlib.
+
+    Args:
+        image (Union[np.ndarray, torch.Tensor]): The image to visualize.
+        transpose (bool, optional): Whether to transpose the image. Defaults to False.
+        bdx (Optional[int], optional): The band index to visualize. Defaults to None.
+        scale_factor (float, optional): The scale factor to apply to the image. Defaults to 1.0.
+        figsize (Tuple[int, int], optional): The size of the figure. Defaults to (10, 5).
+        axis_off (bool, optional): Whether to turn off the axis. Defaults to True.
+        title (Optional[str], optional): The title of the plot. Defaults to None.
+        **kwargs (Any): Additional keyword arguments for plt.imshow().
+
+    Returns:
+        None
+    """
+
+    if isinstance(image, torch.Tensor):
+        image = image.cpu().numpy()
+    elif isinstance(image, str):
+        image = rasterio.open(image).read().transpose(1, 2, 0)
+
+    plt.figure(figsize=figsize)
+
+    if transpose:
+        image = image.transpose(1, 2, 0)
+
+    if bdx is not None:
+        image = image[:, :, bdx]
+
+    if len(image.shape) > 2 and image.shape[2] > 3:
+        image = image[:, :, 0:3]
+
+    if scale_factor != 1.0:
+        image = np.clip(image * scale_factor, 0, 1)
+
+    plt.imshow(image, **kwargs)
+    if axis_off:
+        plt.axis("off")
+    if title is not None:
+        plt.title(title)
+    plt.show()
+    plt.close()
+
+
+def plot_images(
+    images: Iterable[torch.Tensor],
+    axs: Iterable[plt.Axes],
+    chnls: List[int] = [2, 1, 0],
+    bright: float = 1.0,
+) -> None:
+    """
+    Plot a list of images.
+
+    Args:
+        images (Iterable[torch.Tensor]): The images to plot.
+        axs (Iterable[plt.Axes]): The axes to plot the images on.
+        chnls (List[int], optional): The channels to use for RGB. Defaults to [2, 1, 0].
+        bright (float, optional): The brightness factor. Defaults to 1.0.
+
+    Returns:
+        None
+    """
+    for img, ax in zip(images, axs):
+        arr = torch.clamp(bright * img, min=0, max=1).numpy()
+        rgb = arr.transpose(1, 2, 0)[:, :, chnls]
+        ax.imshow(rgb)
+        ax.axis("off")
+
+
+def plot_masks(
+    masks: Iterable[torch.Tensor], axs: Iterable[plt.Axes], cmap: str = "Blues"
+) -> None:
+    """
+    Plot a list of masks.
+
+    Args:
+        masks (Iterable[torch.Tensor]): The masks to plot.
+        axs (Iterable[plt.Axes]): The axes to plot the masks on.
+        cmap (str, optional): The colormap to use. Defaults to "Blues".
+
+    Returns:
+        None
+    """
+    for mask, ax in zip(masks, axs):
+        ax.imshow(mask.squeeze().numpy(), cmap=cmap)
+        ax.axis("off")
+
+
+def plot_batch(
+    batch: Dict[str, Any],
+    bright: float = 1.0,
+    cols: int = 4,
+    width: int = 5,
+    chnls: List[int] = [2, 1, 0],
+    cmap: str = "Blues",
+) -> None:
+    """
+    Plot a batch of images and masks. This function is adapted from the plot_batch()
+    function in the torchgeo library at
+    https://torchgeo.readthedocs.io/en/stable/tutorials/earth_surface_water.html
+    Credit to the torchgeo developers for the original implementation.
+
+    Args:
+        batch (Dict[str, Any]): The batch containing images and masks.
+        bright (float, optional): The brightness factor. Defaults to 1.0.
+        cols (int, optional): The number of columns in the plot grid. Defaults to 4.
+        width (int, optional): The width of each plot. Defaults to 5.
+        chnls (List[int], optional): The channels to use for RGB. Defaults to [2, 1, 0].
+        cmap (str, optional): The colormap to use for masks. Defaults to "Blues".
+
+    Returns:
+        None
+    """
+    # Get the samples and the number of items in the batch
+    samples = unbind_samples(batch.copy())
+
+    # if batch contains images and masks, the number of images will be doubled
+    n = 2 * len(samples) if ("image" in batch) and ("mask" in batch) else len(samples)
+
+    # calculate the number of rows in the grid
+    rows = n // cols + (1 if n % cols != 0 else 0)
+
+    # create a grid
+    _, axs = plt.subplots(rows, cols, figsize=(cols * width, rows * width))
+
+    if ("image" in batch) and ("mask" in batch):
+        # plot the images on the even axis
+        plot_images(
+            images=map(lambda x: x["image"], samples),
+            axs=axs.reshape(-1)[::2],
+            chnls=chnls,
+            bright=bright,
+        )
+
+        # plot the masks on the odd axis
+        plot_masks(masks=map(lambda x: x["mask"], samples), axs=axs.reshape(-1)[1::2])
+
+    else:
+        if "image" in batch:
+            plot_images(
+                images=map(lambda x: x["image"], samples),
+                axs=axs.reshape(-1),
+                chnls=chnls,
+                bright=bright,
+            )
+
+        elif "mask" in batch:
+            plot_masks(
+                masks=map(lambda x: x["mask"], samples), axs=axs.reshape(-1), cmap=cmap
+            )
+
+
+def calc_stats(
+    dataset: RasterDataset, divide_by: float = 1.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate the statistics (mean and std) for the entire dataset.
+
+    This function is adapted from the plot_batch() function in the torchgeo library at
+    https://torchgeo.readthedocs.io/en/stable/tutorials/earth_surface_water.html.
+    Credit to the torchgeo developers for the original implementation.
+
+    Warning: This is an approximation. The correct value should take into account the
+    mean for the whole dataset for computing individual stds.
+
+    Args:
+        dataset (RasterDataset): The dataset to calculate statistics for.
+        divide_by (float, optional): The value to divide the image data by. Defaults to 1.0.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: The mean and standard deviation for each band.
+    """
+
+    # To avoid loading the entire dataset in memory, we will loop through each img
+    # The filenames will be retrieved from the dataset's rtree index
+    files = [
+        item.object
+        for item in dataset.index.intersection(dataset.index.bounds, objects=True)
+    ]
+
+    # Resetting statistics
+    accum_mean = 0
+    accum_std = 0
+
+    for file in files:
+        img = rasterio.open(file).read() / divide_by  # type: ignore
+        accum_mean += img.reshape((img.shape[0], -1)).mean(axis=1)
+        accum_std += img.reshape((img.shape[0], -1)).std(axis=1)
+
+    # at the end, we shall have 2 vectors with length n=chnls
+    # we will average them considering the number of images
+    return accum_mean / len(files), accum_std / len(files)
+
+
+def dict_to_rioxarray(data_dict: Dict) -> xr.DataArray:
+    """Convert a dictionary to a xarray DataArray. The dictionary should contain the
+    following keys: "crs", "bounds", and "image". It can be generated from a TorchGeo
+    dataset sampler.
+
+    Args:
+        data_dict (Dict): The dictionary containing the data.
+
+    Returns:
+        xr.DataArray: The xarray DataArray.
+    """
+
+    from affine import Affine
+
+    # Extract components from the dictionary
+    crs = data_dict["crs"]
+    bounds = data_dict["bounds"]
+    image_tensor = data_dict["image"]
+
+    # Convert tensor to numpy array if needed
+    if hasattr(image_tensor, "numpy"):
+        # For PyTorch tensors
+        image_array = image_tensor.numpy()
+    else:
+        # If it's already a numpy array or similar
+        image_array = np.array(image_tensor)
+
+    # Calculate pixel resolution
+    width = image_array.shape[2]  # Width is the size of the last dimension
+    height = image_array.shape[1]  # Height is the size of the middle dimension
+
+    res_x = (bounds.maxx - bounds.minx) / width
+    res_y = (bounds.maxy - bounds.miny) / height
+
+    # Create the transform matrix
+    transform = Affine(res_x, 0.0, bounds.minx, 0.0, -res_y, bounds.maxy)
+
+    # Create dimensions
+    x_coords = np.linspace(bounds.minx + res_x / 2, bounds.maxx - res_x / 2, width)
+    y_coords = np.linspace(bounds.maxy - res_y / 2, bounds.miny + res_y / 2, height)
+
+    # If time dimension exists in the bounds
+    if hasattr(bounds, "mint") and hasattr(bounds, "maxt"):
+        # Create a single time value or range if needed
+        t_coords = [
+            bounds.mint
+        ]  # Or np.linspace(bounds.mint, bounds.maxt, num_time_steps)
+
+        # Create DataArray with time dimension
+        dims = (
+            ("band", "y", "x")
+            if image_array.shape[0] <= 10
+            else ("time", "band", "y", "x")
+        )
+
+        if dims[0] == "band":
+            # For multi-band single time
+            da = xr.DataArray(
+                image_array,
+                dims=dims,
+                coords={
+                    "band": np.arange(1, image_array.shape[0] + 1),
+                    "y": y_coords,
+                    "x": x_coords,
+                },
+            )
+        else:
+            # For multi-time multi-band
+            da = xr.DataArray(
+                image_array,
+                dims=dims,
+                coords={
+                    "time": t_coords,
+                    "band": np.arange(1, image_array.shape[1] + 1),
+                    "y": y_coords,
+                    "x": x_coords,
+                },
+            )
+    else:
+        # Create DataArray without time dimension
+        da = xr.DataArray(
+            image_array,
+            dims=("band", "y", "x"),
+            coords={
+                "band": np.arange(1, image_array.shape[0] + 1),
+                "y": y_coords,
+                "x": x_coords,
+            },
+        )
+
+    # Set spatial attributes
+    da.rio.write_crs(crs, inplace=True)
+    da.rio.write_transform(transform, inplace=True)
+
+    return da
+
+
+def dict_to_image(
+    data_dict: Dict[str, Any], output: Optional[str] = None, **kwargs
+) -> rasterio.DatasetReader:
+    """Convert a dictionary containing spatial data to a rasterio dataset or save it to
+    a file. The dictionary should contain the following keys: "crs", "bounds", and "image".
+    It can be generated from a TorchGeo dataset sampler.
+
+    This function transforms a dictionary with CRS, bounding box, and image data
+    into a rasterio DatasetReader using leafmap's array_to_image utility after
+    first converting to a rioxarray DataArray.
+
+    Args:
+        data_dict: A dictionary containing:
+            - 'crs': A pyproj CRS object
+            - 'bounds': A BoundingBox object with minx, maxx, miny, maxy attributes
+              and optionally mint, maxt for temporal bounds
+            - 'image': A tensor or array-like object with image data
+        output: Optional path to save the image to a file. If not provided, the image
+            will be returned as a rasterio DatasetReader object.
+        **kwargs: Additional keyword arguments to pass to leafmap.array_to_image.
+            Common options include:
+            - colormap: str, name of the colormap (e.g., 'viridis', 'terrain')
+            - vmin: float, minimum value for colormap scaling
+            - vmax: float, maximum value for colormap scaling
+
+    Returns:
+        A rasterio DatasetReader object that can be used for visualization or
+        further processing.
+
+    Examples:
+        >>> image = dict_to_image(
+        ...     {'crs': CRS.from_epsg(26911), 'bounds': bbox, 'image': tensor},
+        ...     colormap='terrain'
+        ... )
+        >>> fig, ax = plt.subplots(figsize=(10, 10))
+        >>> show(image, ax=ax)
+    """
+    da = dict_to_rioxarray(data_dict)
+
+    if output is not None:
+        out_dir = os.path.abspath(os.path.dirname(output))
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        da.rio.to_raster(output)
+        return output
+    else:
+        image = leafmap.array_to_image(da, **kwargs)
+        return image
+
+
+def view_vector(
+    vector_data,
+    column=None,
+    cmap="viridis",
+    figsize=(10, 10),
+    title=None,
+    legend=True,
+    basemap=False,
+    basemap_type="streets",
+    alpha=0.7,
+    edge_color="black",
+    classification="quantiles",
+    n_classes=5,
+    highlight_index=None,
+    highlight_color="red",
+    scheme=None,
+    save_path=None,
+    dpi=300,
+):
+    """
+    Visualize vector datasets with options for styling, classification, basemaps and more.
+
+    This function visualizes GeoDataFrame objects with customizable symbology.
+    It supports different vector types (points, lines, polygons), attribute-based
+    classification, and background basemaps.
+
+    Args:
+        vector_data (geopandas.GeoDataFrame): The vector dataset to visualize.
+        column (str, optional): Column to use for choropleth mapping. If None,
+            a single color will be used. Defaults to None.
+        cmap (str or matplotlib.colors.Colormap, optional): Colormap to use for
+            choropleth mapping. Defaults to "viridis".
+        figsize (tuple, optional): Figure size as (width, height) in inches.
+            Defaults to (10, 10).
+        title (str, optional): Title for the plot. Defaults to None.
+        legend (bool, optional): Whether to display a legend. Defaults to True.
+        basemap (bool, optional): Whether to add a web basemap. Requires contextily.
+            Defaults to False.
+        basemap_type (str, optional): Type of basemap to use. Options: 'streets', 'satellite'.
+            Defaults to 'streets'.
+        alpha (float, optional): Transparency of the vector features, between 0-1.
+            Defaults to 0.7.
+        edge_color (str, optional): Color for feature edges. Defaults to "black".
+        classification (str, optional): Classification method for choropleth maps.
+            Options: "quantiles", "equal_interval", "natural_breaks".
+            Defaults to "quantiles".
+        n_classes (int, optional): Number of classes for choropleth maps.
+            Defaults to 5.
+        highlight_index (list, optional): List of indices to highlight.
+            Defaults to None.
+        highlight_color (str, optional): Color to use for highlighted features.
+            Defaults to "red".
+        scheme (str, optional): MapClassify classification scheme. Overrides
+            classification parameter if provided. Defaults to None.
+        save_path (str, optional): Path to save the figure. If None, the figure
+            is not saved. Defaults to None.
+        dpi (int, optional): DPI for saved figure. Defaults to 300.
+
+    Returns:
+        matplotlib.axes.Axes: The Axes object containing the plot.
+
+    Examples:
+        >>> import geopandas as gpd
+        >>> cities = gpd.read_file("cities.shp")
+        >>> view_vector(cities, "population", cmap="Reds", basemap=True)
+
+        >>> roads = gpd.read_file("roads.shp")
+        >>> view_vector(roads, "type", basemap=True, figsize=(12, 8))
+    """
+    import contextily as ctx
+
+    if isinstance(vector_data, str):
+        vector_data = gpd.read_file(vector_data)
+
+    # Check if input is a GeoDataFrame
+    if not isinstance(vector_data, gpd.GeoDataFrame):
+        raise TypeError("Input data must be a GeoDataFrame")
+
+    # Make a copy to avoid changing the original data
+    gdf = vector_data.copy()
+
+    # Set up figure and axis
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Determine geometry type
+    geom_type = gdf.geometry.iloc[0].geom_type
+
+    # Plotting parameters
+    plot_kwargs = {"alpha": alpha, "ax": ax}
+
+    # Set up keyword arguments based on geometry type
+    if "Point" in geom_type:
+        plot_kwargs["markersize"] = 50
+        plot_kwargs["edgecolor"] = edge_color
+    elif "Line" in geom_type:
+        plot_kwargs["linewidth"] = 1
+    elif "Polygon" in geom_type:
+        plot_kwargs["edgecolor"] = edge_color
+
+    # Classification options
+    if column is not None:
+        if scheme is not None:
+            # Use mapclassify scheme if provided
+            plot_kwargs["scheme"] = scheme
+        else:
+            # Use classification parameter
+            if classification == "quantiles":
+                plot_kwargs["scheme"] = "quantiles"
+            elif classification == "equal_interval":
+                plot_kwargs["scheme"] = "equal_interval"
+            elif classification == "natural_breaks":
+                plot_kwargs["scheme"] = "fisher_jenks"
+
+        plot_kwargs["k"] = n_classes
+        plot_kwargs["cmap"] = cmap
+        plot_kwargs["column"] = column
+        plot_kwargs["legend"] = legend
+
+    # Plot the main data
+    gdf.plot(**plot_kwargs)
+
+    # Highlight specific features if requested
+    if highlight_index is not None:
+        gdf.iloc[highlight_index].plot(
+            ax=ax, color=highlight_color, edgecolor="black", linewidth=2, zorder=5
+        )
+
+    if basemap:
+        try:
+            basemap_options = {
+                "streets": ctx.providers.OpenStreetMap.Mapnik,
+                "satellite": ctx.providers.Esri.WorldImagery,
+            }
+            ctx.add_basemap(ax, crs=gdf.crs, source=basemap_options[basemap_type])
+        except Exception as e:
+            print(f"Could not add basemap: {e}")
+
+    # Set title if provided
+    if title:
+        ax.set_title(title, fontsize=14)
+
+    # Remove axes if not needed
+    ax.set_axis_off()
+
+    # Adjust layout
+    plt.tight_layout()
+
+    # Save figure if a path is provided
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+    return ax
+
+
+def view_vector_interactive(
+    vector_data,
+    layer_name="Vector Layer",
+    tiles_args=None,
+    **kwargs,
+):
+    """
+    Visualize vector datasets with options for styling, classification, basemaps and more.
+
+    This function visualizes GeoDataFrame objects with customizable symbology.
+    It supports different vector types (points, lines, polygons), attribute-based
+    classification, and background basemaps.
+
+    Args:
+        vector_data (geopandas.GeoDataFrame): The vector dataset to visualize.
+        layer_name (str, optional): The name of the layer. Defaults to "Vector Layer".
+        tiles_args (dict, optional): Additional arguments for the localtileserver client.
+            get_folium_tile_layer function. Defaults to None.
+        **kwargs: Additional keyword arguments to pass to GeoDataFrame.explore() function.
+        See https://geopandas.org/en/stable/docs/reference/api/geopandas.GeoDataFrame.explore.html
+
+    Returns:
+        folium.Map: The map object with the vector data added.
+
+    Examples:
+        >>> import geopandas as gpd
+        >>> cities = gpd.read_file("cities.shp")
+        >>> view_vector_interactive(cities)
+
+        >>> roads = gpd.read_file("roads.shp")
+        >>> view_vector_interactive(roads, figsize=(12, 8))
+    """
+    import folium
+    import folium.plugins as plugins
+    from localtileserver import get_folium_tile_layer, TileClient
+    from leafmap import cog_tile
+
+    google_tiles = {
+        "Roadmap": {
+            "url": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+            "attribution": "Google",
+            "name": "Google Maps",
+        },
+        "Satellite": {
+            "url": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+            "attribution": "Google",
+            "name": "Google Satellite",
+        },
+        "Terrain": {
+            "url": "https://mt1.google.com/vt/lyrs=p&x={x}&y={y}&z={z}",
+            "attribution": "Google",
+            "name": "Google Terrain",
+        },
+        "Hybrid": {
+            "url": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+            "attribution": "Google",
+            "name": "Google Hybrid",
+        },
+    }
+
+    basemap_layer_name = None
+    raster_layer = None
+
+    if "tiles" in kwargs and isinstance(kwargs["tiles"], str):
+        if kwargs["tiles"].title() in google_tiles:
+            basemap_layer_name = google_tiles[kwargs["tiles"].title()]["name"]
+            kwargs["tiles"] = google_tiles[kwargs["tiles"].title()]["url"]
+            kwargs["attr"] = "Google"
+        elif kwargs["tiles"].lower().endswith(".tif"):
+            if tiles_args is None:
+                tiles_args = {}
+            if kwargs["tiles"].lower().startswith("http"):
+                basemap_layer_name = "Remote Raster"
+                kwargs["tiles"] = cog_tile(kwargs["tiles"], **tiles_args)
+                kwargs["attr"] = "TiTiler"
+            else:
+                basemap_layer_name = "Local Raster"
+                client = TileClient(kwargs["tiles"])
+                raster_layer = get_folium_tile_layer(client, **tiles_args)
+                kwargs["tiles"] = raster_layer.tiles
+                kwargs["attr"] = "localtileserver"
+
+    if "max_zoom" not in kwargs:
+        kwargs["max_zoom"] = 30
+
+    if isinstance(vector_data, str):
+        vector_data = gpd.read_file(vector_data)
+
+    # Check if input is a GeoDataFrame
+    if not isinstance(vector_data, gpd.GeoDataFrame):
+        raise TypeError("Input data must be a GeoDataFrame")
+
+    layer_control = kwargs.pop("layer_control", True)
+    fullscreen_control = kwargs.pop("fullscreen_control", True)
+
+    m = vector_data.explore(**kwargs)
+
+    # Change the layer name
+    for layer in m._children.values():
+        if isinstance(layer, folium.GeoJson):
+            layer.layer_name = layer_name
+        if isinstance(layer, folium.TileLayer) and basemap_layer_name:
+            layer.layer_name = basemap_layer_name
+
+    if layer_control:
+        m.add_child(folium.LayerControl())
+
+    if fullscreen_control:
+        plugins.Fullscreen().add_to(m)
+
+    return m
+
+
+def regularization(
+    building_polygons,
+    angle_tolerance=10,
+    simplify_tolerance=0.5,
+    orthogonalize=True,
+    preserve_topology=True,
+):
+    """
+    Regularizes building footprint polygons with multiple techniques beyond minimum
+    rotated rectangles.
+
+    Args:
+        building_polygons: GeoDataFrame or list of shapely Polygons containing building footprints
+        angle_tolerance: Degrees within which angles will be regularized to 90/180 degrees
+        simplify_tolerance: Distance tolerance for Douglas-Peucker simplification
+        orthogonalize: Whether to enforce orthogonal angles in the final polygons
+        preserve_topology: Whether to preserve topology during simplification
+
+    Returns:
+        GeoDataFrame or list of shapely Polygons with regularized building footprints
+    """
+    from shapely.geometry import Polygon, shape
+    from shapely.affinity import rotate, translate
+    from shapely import wkt
+
+    regularized_buildings = []
+
+    # Check if we're dealing with a GeoDataFrame
+    if isinstance(building_polygons, gpd.GeoDataFrame):
+        geom_objects = building_polygons.geometry
+    else:
+        geom_objects = building_polygons
+
+    for building in geom_objects:
+        # Handle potential string representations of geometries
+        if isinstance(building, str):
+            try:
+                # Try to parse as WKT
+                building = wkt.loads(building)
+            except Exception:
+                print(f"Failed to parse geometry string: {building[:30]}...")
+                continue
+
+        # Ensure we have a valid geometry
+        if not hasattr(building, "simplify"):
+            print(f"Invalid geometry type: {type(building)}")
+            continue
+
+        # Step 1: Simplify to remove noise and small vertices
+        simplified = building.simplify(
+            simplify_tolerance, preserve_topology=preserve_topology
+        )
+
+        if orthogonalize:
+            # Make sure we have a valid polygon with an exterior
+            if not hasattr(simplified, "exterior") or simplified.exterior is None:
+                print(f"Simplified geometry has no exterior: {simplified}")
+                regularized_buildings.append(building)  # Use original instead
+                continue
+
+            # Step 2: Get the dominant angle to rotate building
+            coords = np.array(simplified.exterior.coords)
+
+            # Make sure we have enough coordinates for angle calculation
+            if len(coords) < 3:
+                print(f"Not enough coordinates for angle calculation: {len(coords)}")
+                regularized_buildings.append(building)  # Use original instead
+                continue
+
+            segments = np.diff(coords, axis=0)
+            angles = np.arctan2(segments[:, 1], segments[:, 0]) * 180 / np.pi
+
+            # Find most common angle classes (0, 90, 180, 270 degrees)
+            binned_angles = np.round(angles / 90) * 90
+            dominant_angle = np.bincount(binned_angles.astype(int) % 180).argmax()
+
+            # Step 3: Rotate to align with axes, regularize, then rotate back
+            rotated = rotate(simplified, -dominant_angle, origin="centroid")
+
+            # Step 4: Rectify coordinates to enforce right angles
+            ext_coords = np.array(rotated.exterior.coords)
+            rect_coords = []
+
+            # Regularize each vertex to create orthogonal corners
+            for i in range(len(ext_coords) - 1):
+                rect_coords.append(ext_coords[i])
+
+                # Check if we need to add a right-angle vertex
+                angle = (
+                    np.arctan2(
+                        ext_coords[(i + 1) % (len(ext_coords) - 1), 1]
+                        - ext_coords[i, 1],
+                        ext_coords[(i + 1) % (len(ext_coords) - 1), 0]
+                        - ext_coords[i, 0],
+                    )
+                    * 180
+                    / np.pi
+                )
+
+                if abs(angle % 90) > angle_tolerance and abs(angle % 90) < (
+                    90 - angle_tolerance
+                ):
+                    # Add intermediate point to create right angle
+                    rect_coords.append(
+                        [
+                            ext_coords[(i + 1) % (len(ext_coords) - 1), 0],
+                            ext_coords[i, 1],
+                        ]
+                    )
+
+            # Close the polygon by adding the first point again
+            rect_coords.append(rect_coords[0])
+
+            # Create regularized polygon and rotate back
+            regularized = Polygon(rect_coords)
+            final_building = rotate(regularized, dominant_angle, origin="centroid")
+        else:
+            final_building = simplified
+
+        regularized_buildings.append(final_building)
+
+    # If input was a GeoDataFrame, return a GeoDataFrame
+    if isinstance(building_polygons, gpd.GeoDataFrame):
+        return gpd.GeoDataFrame(
+            geometry=regularized_buildings, crs=building_polygons.crs
+        )
+    else:
+        return regularized_buildings
+
+
+def hybrid_regularization(building_polygons):
+    """
+    A comprehensive hybrid approach to building footprint regularization.
+
+    Applies different strategies based on building characteristics.
+
+    Args:
+        building_polygons: GeoDataFrame or list of shapely Polygons containing building footprints
+
+    Returns:
+        GeoDataFrame or list of shapely Polygons with regularized building footprints
+    """
+    from shapely.geometry import Polygon
+    from shapely.affinity import rotate
+
+    # Use minimum_rotated_rectangle instead of oriented_envelope
+    try:
+        from shapely.minimum_rotated_rectangle import minimum_rotated_rectangle
+    except ImportError:
+        # For older Shapely versions
+        def minimum_rotated_rectangle(geom):
+            """Calculate the minimum rotated rectangle for a geometry"""
+            # For older Shapely versions, implement a simple version
+            return geom.minimum_rotated_rectangle
+
+    # Determine input type for correct return
+    is_gdf = isinstance(building_polygons, gpd.GeoDataFrame)
+
+    # Extract geometries if GeoDataFrame
+    if is_gdf:
+        geom_objects = building_polygons.geometry
+    else:
+        geom_objects = building_polygons
+
+    results = []
+
+    for building in geom_objects:
+        # 1. Analyze building characteristics
+        if not hasattr(building, "exterior") or building.is_empty:
+            results.append(building)
+            continue
+
+        # Calculate shape complexity metrics
+        complexity = building.length / (4 * np.sqrt(building.area))
+
+        # Calculate dominant angle
+        coords = np.array(building.exterior.coords)[:-1]
+        segments = np.diff(np.vstack([coords, coords[0]]), axis=0)
+        segment_lengths = np.sqrt(segments[:, 0] ** 2 + segments[:, 1] ** 2)
+        segment_angles = np.arctan2(segments[:, 1], segments[:, 0]) * 180 / np.pi
+
+        # Weight angles by segment length
+        hist, bins = np.histogram(
+            segment_angles % 180, bins=36, range=(0, 180), weights=segment_lengths
+        )
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+        dominant_angle = bin_centers[np.argmax(hist)]
+
+        # Check if building is close to orthogonal
+        is_orthogonal = min(dominant_angle % 45, 45 - (dominant_angle % 45)) < 5
+
+        # 2. Apply appropriate regularization strategy
+        if complexity > 1.5:
+            # Complex buildings: use minimum rotated rectangle
+            result = minimum_rotated_rectangle(building)
+        elif is_orthogonal:
+            # Near-orthogonal buildings: orthogonalize in place
+            rotated = rotate(building, -dominant_angle, origin="centroid")
+
+            # Create orthogonal hull in rotated space
+            bounds = rotated.bounds
+            ortho_hull = Polygon(
+                [
+                    (bounds[0], bounds[1]),
+                    (bounds[2], bounds[1]),
+                    (bounds[2], bounds[3]),
+                    (bounds[0], bounds[3]),
+                ]
+            )
+
+            result = rotate(ortho_hull, dominant_angle, origin="centroid")
+        else:
+            # Diagonal buildings: use custom approach for diagonal buildings
+            # Rotate to align with axes
+            rotated = rotate(building, -dominant_angle, origin="centroid")
+
+            # Simplify in rotated space
+            simplified = rotated.simplify(0.3, preserve_topology=True)
+
+            # Get the bounds in rotated space
+            bounds = simplified.bounds
+            min_x, min_y, max_x, max_y = bounds
+
+            # Create a rectangular hull in rotated space
+            rect_poly = Polygon(
+                [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
+            )
+
+            # Rotate back to original orientation
+            result = rotate(rect_poly, dominant_angle, origin="centroid")
+
+        results.append(result)
+
+    # Return in same format as input
+    if is_gdf:
+        return gpd.GeoDataFrame(geometry=results, crs=building_polygons.crs)
+    else:
+        return results
+
+
+def adaptive_regularization(
+    building_polygons, simplify_tolerance=0.5, area_threshold=0.9, preserve_shape=True
+):
+    """
+    Adaptively regularizes building footprints based on their characteristics.
+
+    This approach determines the best regularization method for each building.
+
+    Args:
+        building_polygons: GeoDataFrame or list of shapely Polygons
+        simplify_tolerance: Distance tolerance for simplification
+        area_threshold: Minimum acceptable area ratio
+        preserve_shape: Whether to preserve overall shape for complex buildings
+
+    Returns:
+        GeoDataFrame or list of shapely Polygons with regularized building footprints
+    """
+    from shapely.geometry import Polygon
+    from shapely.affinity import rotate
+
+    # Analyze the overall dataset to set appropriate parameters
+    if is_gdf := isinstance(building_polygons, gpd.GeoDataFrame):
+        geom_objects = building_polygons.geometry
+    else:
+        geom_objects = building_polygons
+
+    results = []
+
+    for building in geom_objects:
+        # Skip invalid geometries
+        if not hasattr(building, "exterior") or building.is_empty:
+            results.append(building)
+            continue
+
+        # Measure building complexity
+        complexity = building.length / (4 * np.sqrt(building.area))
+
+        # Determine if the building has a clear principal direction
+        coords = np.array(building.exterior.coords)[:-1]
+        segments = np.diff(np.vstack([coords, coords[0]]), axis=0)
+        segment_lengths = np.sqrt(segments[:, 0] ** 2 + segments[:, 1] ** 2)
+        angles = np.arctan2(segments[:, 1], segments[:, 0]) * 180 / np.pi
+
+        # Normalize angles to 0-180 range and get histogram
+        norm_angles = angles % 180
+        hist, bins = np.histogram(
+            norm_angles, bins=18, range=(0, 180), weights=segment_lengths
+        )
+
+        # Calculate direction clarity (ratio of longest direction to total)
+        direction_clarity = np.max(hist) / np.sum(hist) if np.sum(hist) > 0 else 0
+
+        # Choose regularization method based on building characteristics
+        if complexity < 1.2 and direction_clarity > 0.5:
+            # Simple building with clear direction: use rotated rectangle
+            bin_max = np.argmax(hist)
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+            dominant_angle = bin_centers[bin_max]
+
+            # Rotate to align with coordinate system
+            rotated = rotate(building, -dominant_angle, origin="centroid")
+
+            # Create bounding box in rotated space
+            bounds = rotated.bounds
+            rect = Polygon(
+                [
+                    (bounds[0], bounds[1]),
+                    (bounds[2], bounds[1]),
+                    (bounds[2], bounds[3]),
+                    (bounds[0], bounds[3]),
+                ]
+            )
+
+            # Rotate back
+            result = rotate(rect, dominant_angle, origin="centroid")
+
+            # Quality check
+            if (
+                result.area / building.area < area_threshold
+                or result.area / building.area > (1.0 / area_threshold)
+            ):
+                # Too much area change, use simplified original
+                result = building.simplify(simplify_tolerance, preserve_topology=True)
+
+        else:
+            # Complex building or no clear direction: preserve shape
+            if preserve_shape:
+                # Simplify with topology preservation
+                result = building.simplify(simplify_tolerance, preserve_topology=True)
+            else:
+                # Fall back to convex hull for very complex shapes
+                result = building.convex_hull
+
+        results.append(result)
+
+    # Return in same format as input
+    if is_gdf:
+        return gpd.GeoDataFrame(geometry=results, crs=building_polygons.crs)
+    else:
+        return results
+
+
+def install_package(package):
+    """Install a Python package.
+
+    Args:
+        package (str | list): The package name or a GitHub URL or a list of package names or GitHub URLs.
+    """
+    import subprocess
+
+    if isinstance(package, str):
+        packages = [package]
+    elif isinstance(package, list):
+        packages = package
+    else:
+        raise ValueError("The package argument must be a string or a list of strings.")
+
+    for package in packages:
+        if package.startswith("https"):
+            package = f"git+{package}"
+
+        # Execute pip install command and show output in real-time
+        command = f"pip install {package}"
+        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
+
+        # Print output in real-time
+        while True:
+            output = process.stdout.readline()
+            if output == b"" and process.poll() is not None:
+                break
+            if output:
+                print(output.decode("utf-8").strip())
+
+        # Wait for process to complete
+        process.wait()
+
+
+def create_split_map(
+    left_layer: Optional[str] = "TERRAIN",
+    right_layer: Optional[str] = "OpenTopoMap",
+    left_args: Optional[dict] = None,
+    right_args: Optional[dict] = None,
+    left_array_args: Optional[dict] = None,
+    right_array_args: Optional[dict] = None,
+    zoom_control: Optional[bool] = True,
+    fullscreen_control: Optional[bool] = True,
+    layer_control: Optional[bool] = True,
+    add_close_button: Optional[bool] = False,
+    left_label: Optional[str] = None,
+    right_label: Optional[str] = None,
+    left_position: Optional[str] = "bottomleft",
+    right_position: Optional[str] = "bottomright",
+    widget_layout: Optional[dict] = None,
+    draggable: Optional[bool] = True,
+    center: Optional[List[float]] = [20, 0],
+    zoom: Optional[int] = 2,
+    height: Optional[int] = "600px",
+    basemap: Optional[str] = None,
+    basemap_args: Optional[dict] = None,
+    m=None,
+    **kwargs,
+) -> None:
+    """Adds split map.
+
+    Args:
+        left_layer (str, optional): The left tile layer. Can be a local file path, HTTP URL, or a basemap name. Defaults to 'TERRAIN'.
+        right_layer (str, optional): The right tile layer. Can be a local file path, HTTP URL, or a basemap name. Defaults to 'OpenTopoMap'.
+        left_args (dict, optional): The arguments for the left tile layer. Defaults to {}.
+        right_args (dict, optional): The arguments for the right tile layer. Defaults to {}.
+        left_array_args (dict, optional): The arguments for array_to_image for the left layer. Defaults to {}.
+        right_array_args (dict, optional): The arguments for array_to_image for the right layer. Defaults to {}.
+        zoom_control (bool, optional): Whether to add zoom control. Defaults to True.
+        fullscreen_control (bool, optional): Whether to add fullscreen control. Defaults to True.
+        layer_control (bool, optional): Whether to add layer control. Defaults to True.
+        add_close_button (bool, optional): Whether to add a close button. Defaults to False.
+        left_label (str, optional): The label for the left layer. Defaults to None.
+        right_label (str, optional): The label for the right layer. Defaults to None.
+        left_position (str, optional): The position for the left label. Defaults to "bottomleft".
+        right_position (str, optional): The position for the right label. Defaults to "bottomright".
+        widget_layout (dict, optional): The layout for the widget. Defaults to None.
+        draggable (bool, optional): Whether the split map is draggable. Defaults to True.
+    """
+
+    if left_args is None:
+        left_args = {}
+
+    if right_args is None:
+        right_args = {}
+
+    if left_array_args is None:
+        left_array_args = {}
+
+    if right_array_args is None:
+        right_array_args = {}
+
+    if basemap_args is None:
+        basemap_args = {}
+
+    if m is None:
+        m = leafmap.Map(center=center, zoom=zoom, height=height, **kwargs)
+        m.clear_layers()
+    if isinstance(basemap, str):
+        if basemap.endswith(".tif"):
+            if basemap.startswith("http"):
+                m.add_cog_layer(basemap, name="Basemap", **basemap_args)
+            else:
+                m.add_raster(basemap, name="Basemap", **basemap_args)
+        else:
+            m.add_basemap(basemap)
+    m.split_map(
+        left_layer=left_layer,
+        right_layer=right_layer,
+        left_args=left_args,
+        right_args=right_args,
+        left_array_args=left_array_args,
+        right_array_args=right_array_args,
+        zoom_control=zoom_control,
+        fullscreen_control=fullscreen_control,
+        layer_control=layer_control,
+        add_close_button=add_close_button,
+        left_label=left_label,
+        right_label=right_label,
+        left_position=left_position,
+        right_position=right_position,
+        widget_layout=widget_layout,
+        draggable=draggable,
+    )
+
+    return m
 
 
 def download_file(url, output_path=None, overwrite=False):
@@ -282,7 +1509,11 @@ def get_vector_info(vector_path):
         dict: Dictionary containing the basic information about the vector dataset
     """
     # Open the vector dataset
-    gdf = gpd.read_file(vector_path)
+    gdf = (
+        gpd.read_parquet(vector_path)
+        if vector_path.endswith(".parquet")
+        else gpd.read_file(vector_path)
+    )
 
     # Get basic metadata
     info = {
@@ -353,7 +1584,11 @@ def print_vector_info(vector_path, show_preview=True, figsize=(10, 8)):
 
         # Show a preview if requested
         if show_preview:
-            gdf = gpd.read_file(vector_path)
+            gdf = (
+                gpd.read_parquet(vector_path)
+                if vector_path.endswith(".parquet")
+                else gpd.read_file(vector_path)
+            )
             fig, ax = plt.subplots(figsize=figsize)
             gdf.plot(ax=ax, cmap="viridis")
             ax.set_title(f"Preview: {vector_path}")
@@ -589,21 +1824,21 @@ def clip_raster_by_bbox(
         RuntimeError: If the clipping operation fails.
 
     Examples:
-        # Clip using geographic coordinates in the same CRS as the raster
+        Clip using geographic coordinates in the same CRS as the raster
         >>> clip_raster_by_bbox('input.tif', 'clipped_geo.tif', (100, 200, 300, 400))
         'clipped_geo.tif'
 
-        # Clip using WGS84 coordinates when the raster is in a different CRS
+        Clip using WGS84 coordinates when the raster is in a different CRS
         >>> clip_raster_by_bbox('input.tif', 'clipped_wgs84.tif', (-122.5, 37.7, -122.4, 37.8),
         ...                     bbox_crs="EPSG:4326")
         'clipped_wgs84.tif'
 
-        # Clip using row/column indices
+        Clip using row/column indices
         >>> clip_raster_by_bbox('input.tif', 'clipped_pixel.tif', (50, 100, 150, 200),
         ...                     bbox_type="pixel")
         'clipped_pixel.tif'
 
-        # Clip with band selection
+        Clip with band selection
         >>> clip_raster_by_bbox('input.tif', 'clipped_bands.tif', (100, 200, 300, 400),
         ...                     bands=[1, 3])
         'clipped_bands.tif'
@@ -2807,7 +4042,8 @@ def masks_to_vector(
     output_path=None,
     simplify_tolerance=1.0,
     mask_threshold=0.5,
-    min_area=100,
+    min_object_area=100,
+    max_object_area=None,
     nms_iou_threshold=0.5,
 ):
     """
@@ -2818,7 +4054,8 @@ def masks_to_vector(
         output_path: Path to save the output GeoJSON (default: mask_path with .geojson extension)
         simplify_tolerance: Tolerance for polygon simplification (default: self.simplify_tolerance)
         mask_threshold: Threshold for mask binarization (default: self.mask_threshold)
-        min_area: Minimum area in pixels to keep a building (default: self.small_building_area)
+        min_object_area: Minimum area in pixels to keep a building (default: self.min_object_area)
+        max_object_area: Maximum area in pixels to keep a building (default: self.max_object_area)
         nms_iou_threshold: IoU threshold for non-maximum suppression (default: self.nms_iou_threshold)
 
     Returns:
@@ -2830,7 +4067,7 @@ def masks_to_vector(
 
     print(f"Converting mask to GeoJSON with parameters:")
     print(f"- Mask threshold: {mask_threshold}")
-    print(f"- Min building area: {min_area}")
+    print(f"- Min building area: {min_object_area}")
     print(f"- Simplify tolerance: {simplify_tolerance}")
     print(f"- NMS IoU threshold: {nms_iou_threshold}")
 
@@ -2870,7 +4107,11 @@ def masks_to_vector(
             area = stats[i, cv2.CC_STAT_AREA]
 
             # Skip if too small
-            if area < min_area:
+            if area < min_object_area:
+                continue
+
+            # Skip if too large
+            if max_object_area is not None and area > max_object_area:
                 continue
 
             # Create a mask for this building
@@ -2997,5 +4238,1579 @@ def masks_to_vector(
         if output_path is not None:
             gdf.to_file(output_path)
             print(f"Saved {len(gdf)} building footprints to {output_path}")
+
+        return gdf
+
+
+def read_vector(source, layer=None, **kwargs):
+    """Reads vector data from various formats including GeoParquet.
+
+    This function dynamically determines the file type based on extension
+    and reads it into a GeoDataFrame. It supports both local files and HTTP/HTTPS URLs.
+
+    Args:
+        source: String path to the vector file or URL.
+        layer: String or integer specifying which layer to read from multi-layer
+            files (only applicable for formats like GPKG, GeoJSON, etc.).
+            Defaults to None.
+        **kwargs: Additional keyword arguments to pass to the underlying reader.
+
+    Returns:
+        geopandas.GeoDataFrame: A GeoDataFrame containing the vector data.
+
+    Raises:
+        ValueError: If the file format is not supported or source cannot be accessed.
+
+    Examples:
+        Read a local shapefile
+        >>> gdf = read_vector("path/to/data.shp")
+        >>>
+        Read a GeoParquet file from URL
+        >>> gdf = read_vector("https://example.com/data.parquet")
+        >>>
+        Read a specific layer from a GeoPackage
+        >>> gdf = read_vector("path/to/data.gpkg", layer="layer_name")
+    """
+
+    import fiona
+    import urllib.parse
+
+    # Determine if source is a URL or local file
+    parsed_url = urllib.parse.urlparse(source)
+    is_url = parsed_url.scheme in ["http", "https"]
+
+    # If it's a local file, check if it exists
+    if not is_url and not os.path.exists(source):
+        raise ValueError(f"File does not exist: {source}")
+
+    # Get file extension
+    _, ext = os.path.splitext(source)
+    ext = ext.lower()
+
+    # Handle GeoParquet files
+    if ext in [".parquet", ".pq", ".geoparquet"]:
+        return gpd.read_parquet(source, **kwargs)
+
+    # Handle common vector formats
+    if ext in [".shp", ".geojson", ".json", ".gpkg", ".gml", ".kml", ".gpx"]:
+        # For formats that might have multiple layers
+        if ext in [".gpkg", ".gml"] and layer is not None:
+            return gpd.read_file(source, layer=layer, **kwargs)
+        return gpd.read_file(source, **kwargs)
+
+    # Try to use fiona to identify valid layers for formats that might have them
+    # Only attempt this for local files as fiona.listlayers might not work with URLs
+    if layer is None and ext in [".gpkg", ".gml"] and not is_url:
+        try:
+            layers = fiona.listlayers(source)
+            if layers:
+                return gpd.read_file(source, layer=layers[0], **kwargs)
+        except Exception:
+            # If listing layers fails, we'll fall through to the generic read attempt
+            pass
+
+    # For other formats or when layer listing fails, attempt to read using GeoPandas
+    try:
+        return gpd.read_file(source, **kwargs)
+    except Exception as e:
+        raise ValueError(f"Could not read from source '{source}': {str(e)}")
+
+
+def read_raster(source, band=None, masked=True, **kwargs):
+    """Reads raster data from various formats using rioxarray.
+
+    This function reads raster data from local files or URLs into a rioxarray
+    data structure with preserved geospatial metadata.
+
+    Args:
+        source: String path to the raster file or URL.
+        band: Integer or list of integers specifying which band(s) to read.
+            Defaults to None (all bands).
+        masked: Boolean indicating whether to mask nodata values.
+            Defaults to True.
+        **kwargs: Additional keyword arguments to pass to rioxarray.open_rasterio.
+
+    Returns:
+        xarray.DataArray: A DataArray containing the raster data with geospatial
+            metadata preserved.
+
+    Raises:
+        ValueError: If the file format is not supported or source cannot be accessed.
+
+    Examples:
+        Read a local GeoTIFF
+        >>> raster = read_raster("path/to/data.tif")
+        >>>
+        Read only band 1 from a remote GeoTIFF
+        >>> raster = read_raster("https://example.com/data.tif", band=1)
+        >>>
+        Read a raster without masking nodata values
+        >>> raster = read_raster("path/to/data.tif", masked=False)
+    """
+    import urllib.parse
+    from rasterio.errors import RasterioIOError
+
+    # Determine if source is a URL or local file
+    parsed_url = urllib.parse.urlparse(source)
+    is_url = parsed_url.scheme in ["http", "https"]
+
+    # If it's a local file, check if it exists
+    if not is_url and not os.path.exists(source):
+        raise ValueError(f"Raster file does not exist: {source}")
+
+    try:
+        # Open the raster with rioxarray
+        raster = rxr.open_rasterio(source, masked=masked, **kwargs)
+
+        # Handle band selection if specified
+        if band is not None:
+            if isinstance(band, (list, tuple)):
+                # Convert from 1-based indexing to 0-based indexing
+                band_indices = [b - 1 for b in band]
+                raster = raster.isel(band=band_indices)
+            else:
+                # Single band selection (convert from 1-based to 0-based indexing)
+                raster = raster.isel(band=band - 1)
+
+        return raster
+
+    except RasterioIOError as e:
+        raise ValueError(f"Could not read raster from source '{source}': {str(e)}")
+    except Exception as e:
+        raise ValueError(f"Error reading raster data: {str(e)}")
+
+
+def temp_file_path(ext):
+    """Returns a temporary file path.
+
+    Args:
+        ext (str): The file extension.
+
+    Returns:
+        str: The temporary file path.
+    """
+
+    import tempfile
+    import uuid
+
+    if not ext.startswith("."):
+        ext = "." + ext
+    file_id = str(uuid.uuid4())
+    file_path = os.path.join(tempfile.gettempdir(), f"{file_id}{ext}")
+
+    return file_path
+
+
+def region_groups(
+    image: Union[str, "xr.DataArray", np.ndarray],
+    connectivity: int = 1,
+    min_size: int = 10,
+    max_size: Optional[int] = None,
+    threshold: Optional[int] = None,
+    properties: Optional[List[str]] = None,
+    intensity_image: Optional[Union[str, "xr.DataArray", np.ndarray]] = None,
+    out_csv: Optional[str] = None,
+    out_vector: Optional[str] = None,
+    out_image: Optional[str] = None,
+    **kwargs: Any,
+) -> Union[Tuple[np.ndarray, "pd.DataFrame"], Tuple["xr.DataArray", "pd.DataFrame"]]:
+    """
+    Segment regions in an image and filter them based on size.
+
+    Args:
+        image (Union[str, xr.DataArray, np.ndarray]): Input image, can be a file
+            path, xarray DataArray, or numpy array.
+        connectivity (int, optional): Connectivity for labeling. Defaults to 1
+            for 4-connectivity. Use 2 for 8-connectivity.
+        min_size (int, optional): Minimum size of regions to keep. Defaults to 10.
+        max_size (Optional[int], optional): Maximum size of regions to keep.
+            Defaults to None.
+        threshold (Optional[int], optional): Threshold for filling holes.
+            Defaults to None, which is equal to min_size.
+        properties (Optional[List[str]], optional): List of properties to measure.
+            See https://scikit-image.org/docs/stable/api/skimage.measure.html#skimage.measure.regionprops
+            Defaults to None.
+        intensity_image (Optional[Union[str, xr.DataArray, np.ndarray]], optional):
+            Intensity image to measure properties. Defaults to None.
+        out_csv (Optional[str], optional): Path to save the properties as a CSV file.
+            Defaults to None.
+        out_vector (Optional[str], optional): Path to save the vector file.
+            Defaults to None.
+        out_image (Optional[str], optional): Path to save the output image.
+            Defaults to None.
+
+    Returns:
+        Union[Tuple[np.ndarray, pd.DataFrame], Tuple[xr.DataArray, pd.DataFrame]]: Labeled image and properties DataFrame.
+    """
+    from skimage import measure
+    import scipy.ndimage as ndi
+
+    if isinstance(image, str):
+        ds = rxr.open_rasterio(image)
+        da = ds.sel(band=1)
+        array = da.values.squeeze()
+    elif isinstance(image, xr.DataArray):
+        da = image
+        array = image.values.squeeze()
+    elif isinstance(image, np.ndarray):
+        array = image
+    else:
+        raise ValueError(
+            "The input image must be a file path, xarray DataArray, or numpy array."
+        )
+
+    if threshold is None:
+        threshold = min_size
+
+    # Define a custom function to calculate median intensity
+    def intensity_median(region, intensity_image):
+        # Extract the intensity values for the region
+        return np.median(intensity_image[region])
+
+    # Add your custom function to the list of extra properties
+    if intensity_image is not None:
+        extra_props = (intensity_median,)
+    else:
+        extra_props = None
+
+    if properties is None:
+        properties = [
+            "label",
+            "area",
+            "area_bbox",
+            "area_convex",
+            "area_filled",
+            "major_length",
+            "minor_length",
+            "eccentricity",
+            "diameter_areagth",
+            "extent",
+            "orientation",
+            "perimeter",
+            "solidity",
+        ]
+
+        if intensity_image is not None:
+
+            properties += [
+                "intensity_max",
+                "intensity_mean",
+                "intensity_min",
+                "intensity_std",
+            ]
+
+    if intensity_image is not None:
+        if isinstance(intensity_image, str):
+            ds = rxr.open_rasterio(intensity_image)
+            intensity_da = ds.sel(band=1)
+            intensity_image = intensity_da.values.squeeze()
+        elif isinstance(intensity_image, xr.DataArray):
+            intensity_image = intensity_image.values.squeeze()
+        elif isinstance(intensity_image, np.ndarray):
+            pass
+        else:
+            raise ValueError(
+                "The intensity_image must be a file path, xarray DataArray, or numpy array."
+            )
+
+    label_image = measure.label(array, connectivity=connectivity)
+    props = measure.regionprops_table(
+        label_image, properties=properties, intensity_image=intensity_image, **kwargs
+    )
+
+    df = pd.DataFrame(props)
+
+    # Get the labels of regions with area smaller than the threshold
+    small_regions = df[df["area"] < min_size]["label"].values
+    # Set the corresponding labels in the label_image to zero
+    for region_label in small_regions:
+        label_image[label_image == region_label] = 0
+
+    if max_size is not None:
+        large_regions = df[df["area"] > max_size]["label"].values
+        for region_label in large_regions:
+            label_image[label_image == region_label] = 0
+
+    # Find the background (holes) which are zeros
+    holes = label_image == 0
+
+    # Label the holes (connected components in the background)
+    labeled_holes, _ = ndi.label(holes)
+
+    # Measure properties of the labeled holes, including area and bounding box
+    hole_props = measure.regionprops(labeled_holes)
+
+    # Loop through each hole and fill it if it is smaller than the threshold
+    for prop in hole_props:
+        if prop.area < threshold:
+            # Get the coordinates of the small hole
+            coords = prop.coords
+
+            # Find the surrounding region's ID (non-zero value near the hole)
+            surrounding_region_values = []
+            for coord in coords:
+                x, y = coord
+                # Get a 3x3 neighborhood around the hole pixel
+                neighbors = label_image[max(0, x - 1) : x + 2, max(0, y - 1) : y + 2]
+                # Exclude the hole pixels (zeros) and get region values
+                region_values = neighbors[neighbors != 0]
+                if region_values.size > 0:
+                    surrounding_region_values.append(
+                        region_values[0]
+                    )  # Take the first non-zero value
+
+            if surrounding_region_values:
+                # Fill the hole with the mode (most frequent) of the surrounding region values
+                fill_value = max(
+                    set(surrounding_region_values), key=surrounding_region_values.count
+                )
+                label_image[coords[:, 0], coords[:, 1]] = fill_value
+
+    label_image, num_labels = measure.label(
+        label_image, connectivity=connectivity, return_num=True
+    )
+    props = measure.regionprops_table(
+        label_image,
+        properties=properties,
+        intensity_image=intensity_image,
+        extra_properties=extra_props,
+        **kwargs,
+    )
+
+    df = pd.DataFrame(props)
+    df["elongation"] = df["major_length"] / df["minor_length"]
+
+    dtype = "uint8"
+    if num_labels > 255 and num_labels <= 65535:
+        dtype = "uint16"
+    elif num_labels > 65535:
+        dtype = "uint32"
+
+    if out_csv is not None:
+        df.to_csv(out_csv, index=False)
+
+    if isinstance(image, np.ndarray):
+        return label_image, df
+    else:
+        da.values = label_image
+        if out_image is not None:
+            da.rio.to_raster(out_image, dtype=dtype)
+            if out_vector is not None:
+                tmp_vector = temp_file_path(".gpkg")
+                raster_to_vector(out_image, tmp_vector)
+                gdf = gpd.read_file(tmp_vector)
+                gdf["label"] = gdf["value"].astype(int)
+                gdf.drop(columns=["value"], inplace=True)
+                gdf2 = pd.merge(gdf, df, on="label", how="left")
+                gdf2.to_file(out_vector)
+                gdf2.sort_values("label", inplace=True)
+                df = gdf2
+        return da, df
+
+
+def add_geometric_properties(data, properties=None, area_unit="m2", length_unit="m"):
+    """Calculates geometric properties and adds them to the GeoDataFrame.
+
+    This function calculates various geometric properties of features in a
+    GeoDataFrame and adds them as new columns without modifying existing attributes.
+
+    Args:
+        data: GeoDataFrame containing vector features.
+        properties: List of geometric properties to calculate. Options include:
+            'area', 'length', 'perimeter', 'centroid_x', 'centroid_y', 'bounds',
+            'convex_hull_area', 'orientation', 'complexity', 'area_bbox',
+            'area_convex', 'area_filled', 'major_length', 'minor_length',
+            'eccentricity', 'diameter_areagth', 'extent', 'solidity',
+            'elongation'.
+            Defaults to ['area', 'length'] if None.
+        area_unit: String specifying the unit for area calculation ('m2', 'km2',
+            'ha'). Defaults to 'm2'.
+        length_unit: String specifying the unit for length calculation ('m', 'km').
+            Defaults to 'm'.
+
+    Returns:
+        geopandas.GeoDataFrame: A copy of the input GeoDataFrame with added
+        geometric property columns.
+    """
+    from shapely.ops import unary_union
+
+    if isinstance(data, str):
+        data = read_vector(data)
+
+    # Make a copy to avoid modifying the original
+    result = data.copy()
+
+    # Default properties to calculate
+    if properties is None:
+        properties = [
+            "area",
+            "length",
+            "perimeter",
+            "convex_hull_area",
+            "orientation",
+            "complexity",
+            "area_bbox",
+            "area_convex",
+            "area_filled",
+            "major_length",
+            "minor_length",
+            "eccentricity",
+            "diameter_area",
+            "extent",
+            "solidity",
+            "elongation",
+        ]
+
+    # Make sure we're working with a GeoDataFrame with a valid CRS
+
+    if not isinstance(result, gpd.GeoDataFrame):
+        raise ValueError("Input must be a GeoDataFrame")
+
+    if result.crs is None:
+        raise ValueError(
+            "GeoDataFrame must have a defined coordinate reference system (CRS)"
+        )
+
+    # Ensure we're working with a projected CRS for accurate measurements
+    if result.crs.is_geographic:
+        # Reproject to a suitable projected CRS for accurate measurements
+        result = result.to_crs(result.estimate_utm_crs())
+
+    # Basic area calculation with unit conversion
+    if "area" in properties:
+        # Calculate area (only for polygons)
+        result["area"] = result.geometry.apply(
+            lambda geom: geom.area if isinstance(geom, (Polygon, MultiPolygon)) else 0
+        )
+
+        # Convert to requested units
+        if area_unit == "km2":
+            result["area"] = result["area"] / 1_000_000  # m² to km²
+            result.rename(columns={"area": "area_km2"}, inplace=True)
+        elif area_unit == "ha":
+            result["area"] = result["area"] / 10_000  # m² to hectares
+            result.rename(columns={"area": "area_ha"}, inplace=True)
+        else:  # Default is m²
+            result.rename(columns={"area": "area_m2"}, inplace=True)
+
+    # Length calculation with unit conversion
+    if "length" in properties:
+        # Calculate length (works for lines and polygon boundaries)
+        result["length"] = result.geometry.length
+
+        # Convert to requested units
+        if length_unit == "km":
+            result["length"] = result["length"] / 1_000  # m to km
+            result.rename(columns={"length": "length_km"}, inplace=True)
+        else:  # Default is m
+            result.rename(columns={"length": "length_m"}, inplace=True)
+
+    # Perimeter calculation (for polygons)
+    if "perimeter" in properties:
+        result["perimeter"] = result.geometry.apply(
+            lambda geom: (
+                geom.boundary.length if isinstance(geom, (Polygon, MultiPolygon)) else 0
+            )
+        )
+
+        # Convert to requested units
+        if length_unit == "km":
+            result["perimeter"] = result["perimeter"] / 1_000  # m to km
+            result.rename(columns={"perimeter": "perimeter_km"}, inplace=True)
+        else:  # Default is m
+            result.rename(columns={"perimeter": "perimeter_m"}, inplace=True)
+
+    # Centroid coordinates
+    if "centroid_x" in properties or "centroid_y" in properties:
+        centroids = result.geometry.centroid
+
+        if "centroid_x" in properties:
+            result["centroid_x"] = centroids.x
+
+        if "centroid_y" in properties:
+            result["centroid_y"] = centroids.y
+
+    # Bounding box properties
+    if "bounds" in properties:
+        bounds = result.geometry.bounds
+        result["minx"] = bounds.minx
+        result["miny"] = bounds.miny
+        result["maxx"] = bounds.maxx
+        result["maxy"] = bounds.maxy
+
+    # Area of bounding box
+    if "area_bbox" in properties:
+        bounds = result.geometry.bounds
+        result["area_bbox"] = (bounds.maxx - bounds.minx) * (bounds.maxy - bounds.miny)
+
+        # Convert to requested units
+        if area_unit == "km2":
+            result["area_bbox"] = result["area_bbox"] / 1_000_000
+            result.rename(columns={"area_bbox": "area_bbox_km2"}, inplace=True)
+        elif area_unit == "ha":
+            result["area_bbox"] = result["area_bbox"] / 10_000
+            result.rename(columns={"area_bbox": "area_bbox_ha"}, inplace=True)
+        else:  # Default is m²
+            result.rename(columns={"area_bbox": "area_bbox_m2"}, inplace=True)
+
+    # Area of convex hull
+    if "area_convex" in properties or "convex_hull_area" in properties:
+        result["area_convex"] = result.geometry.convex_hull.area
+
+        # Convert to requested units
+        if area_unit == "km2":
+            result["area_convex"] = result["area_convex"] / 1_000_000
+            result.rename(columns={"area_convex": "area_convex_km2"}, inplace=True)
+        elif area_unit == "ha":
+            result["area_convex"] = result["area_convex"] / 10_000
+            result.rename(columns={"area_convex": "area_convex_ha"}, inplace=True)
+        else:  # Default is m²
+            result.rename(columns={"area_convex": "area_convex_m2"}, inplace=True)
+
+        # For backward compatibility
+        if "convex_hull_area" in properties and "area_convex" not in properties:
+            result["convex_hull_area"] = result["area_convex"]
+            if area_unit == "km2":
+                result.rename(
+                    columns={"convex_hull_area": "convex_hull_area_km2"}, inplace=True
+                )
+            elif area_unit == "ha":
+                result.rename(
+                    columns={"convex_hull_area": "convex_hull_area_ha"}, inplace=True
+                )
+            else:
+                result.rename(
+                    columns={"convex_hull_area": "convex_hull_area_m2"}, inplace=True
+                )
+
+    # Area of filled geometry (no holes)
+    if "area_filled" in properties:
+
+        def get_filled_area(geom):
+            if not isinstance(geom, (Polygon, MultiPolygon)):
+                return 0
+
+            if isinstance(geom, MultiPolygon):
+                # For MultiPolygon, fill all constituent polygons
+                filled_polys = [Polygon(p.exterior) for p in geom.geoms]
+                return unary_union(filled_polys).area
+            else:
+                # For single Polygon, create a new one with just the exterior ring
+                return Polygon(geom.exterior).area
+
+        result["area_filled"] = result.geometry.apply(get_filled_area)
+
+        # Convert to requested units
+        if area_unit == "km2":
+            result["area_filled"] = result["area_filled"] / 1_000_000
+            result.rename(columns={"area_filled": "area_filled_km2"}, inplace=True)
+        elif area_unit == "ha":
+            result["area_filled"] = result["area_filled"] / 10_000
+            result.rename(columns={"area_filled": "area_filled_ha"}, inplace=True)
+        else:  # Default is m²
+            result.rename(columns={"area_filled": "area_filled_m2"}, inplace=True)
+
+    # Axes lengths, eccentricity, orientation, and elongation
+    if any(
+        p in properties
+        for p in [
+            "major_length",
+            "minor_length",
+            "eccentricity",
+            "orientation",
+            "elongation",
+        ]
+    ):
+
+        def get_axes_properties(geom):
+            # Skip non-polygons
+            if not isinstance(geom, (Polygon, MultiPolygon)):
+                return None, None, None, None, None
+
+            # Handle multipolygons by using the largest polygon
+            if isinstance(geom, MultiPolygon):
+                # Get the polygon with the largest area
+                geom = sorted(list(geom.geoms), key=lambda p: p.area, reverse=True)[0]
+
+            try:
+                # Get the minimum rotated rectangle
+                rect = geom.minimum_rotated_rectangle
+
+                # Extract coordinates
+                coords = list(rect.exterior.coords)[
+                    :-1
+                ]  # Remove the duplicated last point
+
+                if len(coords) < 4:
+                    return None, None, None, None, None
+
+                # Calculate lengths of all four sides
+                sides = []
+                for i in range(len(coords)):
+                    p1 = coords[i]
+                    p2 = coords[(i + 1) % len(coords)]
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    length = np.sqrt(dx**2 + dy**2)
+                    angle = np.degrees(np.arctan2(dy, dx)) % 180
+                    sides.append((length, angle, p1, p2))
+
+                # Group sides by length (allowing for small differences due to floating point precision)
+                # This ensures we correctly identify the rectangle's dimensions
+                sides_grouped = {}
+                tolerance = 1e-6  # Tolerance for length comparison
+
+                for s in sides:
+                    length, angle = s[0], s[1]
+                    matched = False
+
+                    for key in sides_grouped:
+                        if abs(length - key) < tolerance:
+                            sides_grouped[key].append(s)
+                            matched = True
+                            break
+
+                    if not matched:
+                        sides_grouped[length] = [s]
+
+                # Get unique lengths (should be 2 for a rectangle, parallel sides have equal length)
+                unique_lengths = sorted(sides_grouped.keys(), reverse=True)
+
+                if len(unique_lengths) != 2:
+                    # If we don't get exactly 2 unique lengths, something is wrong with the rectangle
+                    # Fall back to simpler method using bounds
+                    bounds = rect.bounds
+                    width = bounds[2] - bounds[0]
+                    height = bounds[3] - bounds[1]
+                    major_length = max(width, height)
+                    minor_length = min(width, height)
+                    orientation = 0 if width > height else 90
+                else:
+                    major_length = unique_lengths[0]
+                    minor_length = unique_lengths[1]
+                    # Get orientation from the major axis
+                    orientation = sides_grouped[major_length][0][1]
+
+                # Calculate eccentricity
+                if major_length > 0:
+                    # Eccentricity for an ellipse: e = sqrt(1 - (b²/a²))
+                    # where a is the semi-major axis and b is the semi-minor axis
+                    eccentricity = np.sqrt(
+                        1 - ((minor_length / 2) ** 2 / (major_length / 2) ** 2)
+                    )
+                else:
+                    eccentricity = 0
+
+                # Calculate elongation (ratio of minor to major axis)
+                elongation = major_length / minor_length if major_length > 0 else 1
+
+                return major_length, minor_length, eccentricity, orientation, elongation
+
+            except Exception as e:
+                # For debugging
+                # print(f"Error calculating axes: {e}")
+                return None, None, None, None, None
+
+        # Apply the function and split the results
+        axes_data = result.geometry.apply(get_axes_properties)
+
+        if "major_length" in properties:
+            result["major_length"] = axes_data.apply(lambda x: x[0] if x else None)
+            # Convert to requested units
+            if length_unit == "km":
+                result["major_length"] = result["major_length"] / 1_000
+                result.rename(columns={"major_length": "major_length_km"}, inplace=True)
+            else:
+                result.rename(columns={"major_length": "major_length_m"}, inplace=True)
+
+        if "minor_length" in properties:
+            result["minor_length"] = axes_data.apply(lambda x: x[1] if x else None)
+            # Convert to requested units
+            if length_unit == "km":
+                result["minor_length"] = result["minor_length"] / 1_000
+                result.rename(columns={"minor_length": "minor_length_km"}, inplace=True)
+            else:
+                result.rename(columns={"minor_length": "minor_length_m"}, inplace=True)
+
+        if "eccentricity" in properties:
+            result["eccentricity"] = axes_data.apply(lambda x: x[2] if x else None)
+
+        if "orientation" in properties:
+            result["orientation"] = axes_data.apply(lambda x: x[3] if x else None)
+
+        if "elongation" in properties:
+            result["elongation"] = axes_data.apply(lambda x: x[4] if x else None)
+
+    # Equivalent diameter based on area
+    if "diameter_areagth" in properties:
+
+        def get_equivalent_diameter(geom):
+            if not isinstance(geom, (Polygon, MultiPolygon)) or geom.area <= 0:
+                return None
+            # Diameter of a circle with the same area: d = 2 * sqrt(A / π)
+            return 2 * np.sqrt(geom.area / np.pi)
+
+        result["diameter_areagth"] = result.geometry.apply(get_equivalent_diameter)
+
+        # Convert to requested units
+        if length_unit == "km":
+            result["diameter_areagth"] = result["diameter_areagth"] / 1_000
+            result.rename(
+                columns={"diameter_areagth": "equivalent_diameter_area_km"},
+                inplace=True,
+            )
+        else:
+            result.rename(
+                columns={"diameter_areagth": "equivalent_diameter_area_m"},
+                inplace=True,
+            )
+
+    # Extent (ratio of shape area to bounding box area)
+    if "extent" in properties:
+
+        def get_extent(geom):
+            if not isinstance(geom, (Polygon, MultiPolygon)) or geom.area <= 0:
+                return None
+
+            bounds = geom.bounds
+            bbox_area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
+
+            if bbox_area > 0:
+                return geom.area / bbox_area
+            return None
+
+        result["extent"] = result.geometry.apply(get_extent)
+
+    # Solidity (ratio of shape area to convex hull area)
+    if "solidity" in properties:
+
+        def get_solidity(geom):
+            if not isinstance(geom, (Polygon, MultiPolygon)) or geom.area <= 0:
+                return None
+
+            convex_hull_area = geom.convex_hull.area
+
+            if convex_hull_area > 0:
+                return geom.area / convex_hull_area
+            return None
+
+        result["solidity"] = result.geometry.apply(get_solidity)
+
+    # Complexity (ratio of perimeter to area)
+    if "complexity" in properties:
+
+        def calc_complexity(geom):
+            if isinstance(geom, (Polygon, MultiPolygon)) and geom.area > 0:
+                # Shape index: P / (2 * sqrt(π * A))
+                # Normalized to 1 for a circle, higher for more complex shapes
+                return geom.boundary.length / (2 * np.sqrt(np.pi * geom.area))
+            return None
+
+        result["complexity"] = result.geometry.apply(calc_complexity)
+
+    return result
+
+
+def orthogonalize(
+    input_path,
+    output_path=None,
+    epsilon=0.2,
+    min_area=10,
+    min_segments=4,
+    area_tolerance=0.7,
+    detect_triangles=True,
+):
+    """
+    Orthogonalizes object masks in a GeoTIFF file.
+
+    This function reads a GeoTIFF containing object masks (binary or labeled regions),
+    converts the raster masks to vector polygons, applies orthogonalization to each polygon,
+    and optionally writes the result to a GeoJSON file.
+    The source code is adapted from the Solar Panel Detection algorithm by Esri.
+    See https://www.arcgis.com/home/item.html?id=c2508d72f2614104bfcfd5ccf1429284.
+    Credits to Esri for the original code.
+
+    Args:
+        input_path (str): Path to the input GeoTIFF file.
+        output_path (str, optional): Path to save the output GeoJSON file. If None, no file is saved.
+        epsilon (float, optional): Simplification tolerance for the Douglas-Peucker algorithm.
+            Higher values result in more simplification. Default is 0.2.
+        min_area (float, optional): Minimum area of polygons to process (smaller ones are kept as-is).
+        min_segments (int, optional): Minimum number of segments to keep after simplification.
+            Default is 4 (for rectangular shapes).
+        area_tolerance (float, optional): Allowed ratio of area change. Values less than 1.0 restrict
+            area change. Default is 0.7 (allows reduction to 70% of original area).
+        detect_triangles (bool, optional): If True, performs additional check to avoid creating triangular shapes.
+
+    Returns:
+        geopandas.GeoDataFrame: A GeoDataFrame containing the orthogonalized features.
+    """
+
+    from functools import partial
+
+    def orthogonalize_ring(ring, epsilon=0.2, min_segments=4):
+        """
+        Orthogonalizes a ring (list of coordinates).
+
+        Args:
+            ring (list): List of [x, y] coordinates forming a ring
+            epsilon (float, optional): Simplification tolerance
+            min_segments (int, optional): Minimum number of segments to keep
+
+        Returns:
+            list: Orthogonalized list of coordinates
+        """
+        if len(ring) <= 3:
+            return ring
+
+        # Convert to numpy array
+        ring_arr = np.array(ring)
+
+        # Get orientation
+        angle = math.degrees(get_orientation(ring_arr))
+
+        # Simplify using Ramer-Douglas-Peucker algorithm
+        ring_arr = simplify(ring_arr, eps=epsilon)
+
+        # If simplified too much, adjust epsilon to maintain minimum segments
+        if len(ring_arr) < min_segments:
+            # Try with smaller epsilon until we get at least min_segments points
+            for adjust_factor in [0.75, 0.5, 0.25, 0.1]:
+                test_arr = simplify(np.array(ring), eps=epsilon * adjust_factor)
+                if len(test_arr) >= min_segments:
+                    ring_arr = test_arr
+                    break
+
+        # Convert to dataframe for processing
+        df = to_dataframe(ring_arr)
+
+        # Add orientation information
+        add_orientation(df, angle)
+
+        # Align segments to orthogonal directions
+        df = align(df)
+
+        # Merge collinear line segments
+        df = merge_lines(df)
+
+        if len(df) == 0:
+            return ring
+
+        # If we have a triangle-like result (3 segments), return the original shape
+        if len(df) <= 3:
+            return ring
+
+        # Join the orthogonalized segments back into a ring
+        joined_ring = join_ring(df)
+
+        # If the join operation didn't produce a valid ring, return the original
+        if len(joined_ring) == 0 or len(joined_ring[0]) < 3:
+            return ring
+
+        # Basic validation: if result has 3 or fewer points (triangle), use original
+        if len(joined_ring[0]) <= 3:
+            return ring
+
+        # Convert back to a list and ensure it's closed
+        result = joined_ring[0].tolist()
+        if len(result) > 0 and (result[0] != result[-1]):
+            result.append(result[0])
+
+        return result
+
+    def vectorize_mask(mask, transform):
+        """
+        Converts a binary mask to vector polygons.
+
+        Args:
+            mask (numpy.ndarray): Binary mask where non-zero values represent objects
+            transform (rasterio.transform.Affine): Affine transformation matrix
+
+        Returns:
+            list: List of GeoJSON features
+        """
+        shapes = features.shapes(mask, transform=transform)
+        features_list = []
+
+        for shape, value in shapes:
+            if value > 0:  # Only process non-zero values (actual objects)
+                features_list.append(
+                    {
+                        "type": "Feature",
+                        "properties": {"value": int(value)},
+                        "geometry": shape,
+                    }
+                )
+
+        return features_list
+
+    def rasterize_features(features, shape, transform, dtype=np.uint8):
+        """
+        Converts vector features back to a raster mask.
+
+        Args:
+            features (list): List of GeoJSON features
+            shape (tuple): Shape of the output raster (height, width)
+            transform (rasterio.transform.Affine): Affine transformation matrix
+            dtype (numpy.dtype, optional): Data type of the output raster
+
+        Returns:
+            numpy.ndarray: Rasterized mask
+        """
+        mask = features.rasterize(
+            [
+                (feature["geometry"], feature["properties"]["value"])
+                for feature in features
+            ],
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            dtype=dtype,
+        )
+
+        return mask
+
+    # The following helper functions are from the original code
+    def get_orientation(contour):
+        """
+        Calculate the orientation angle of a contour.
+
+        Args:
+            contour (numpy.ndarray): Array of shape (n, 2) containing point coordinates
+
+        Returns:
+            float: Orientation angle in radians
+        """
+        box = cv2.minAreaRect(contour.astype(int))
+        (cx, cy), (w, h), angle = box
+        return math.radians(angle)
+
+    def simplify(contour, eps=0.2):
+        """
+        Simplify a contour using the Ramer-Douglas-Peucker algorithm.
+
+        Args:
+            contour (numpy.ndarray): Array of shape (n, 2) containing point coordinates
+            eps (float, optional): Epsilon value for simplification
+
+        Returns:
+            numpy.ndarray: Simplified contour
+        """
+        return rdp(contour, epsilon=eps)
+
+    def to_dataframe(ring):
+        """
+        Convert a ring to a pandas DataFrame with line segment information.
+
+        Args:
+            ring (numpy.ndarray): Array of shape (n, 2) containing point coordinates
+
+        Returns:
+            pandas.DataFrame: DataFrame with line segment information
+        """
+        df = pd.DataFrame(ring, columns=["x1", "y1"])
+        df["x2"] = df["x1"].shift(-1)
+        df["y2"] = df["y1"].shift(-1)
+        df.dropna(inplace=True)
+        df["angle_atan"] = np.arctan2((df["y2"] - df["y1"]), (df["x2"] - df["x1"]))
+        df["angle_atan_deg"] = df["angle_atan"] * 57.2958
+        df["len"] = np.sqrt((df["y2"] - df["y1"]) ** 2 + (df["x2"] - df["x1"]) ** 2)
+        df["cx"] = (df["x2"] + df["x1"]) / 2.0
+        df["cy"] = (df["y2"] + df["y1"]) / 2.0
+        return df
+
+    def add_orientation(df, angle):
+        """
+        Add orientation information to the DataFrame.
+
+        Args:
+            df (pandas.DataFrame): DataFrame with line segment information
+            angle (float): Orientation angle in degrees
+
+        Returns:
+            None: Modifies the DataFrame in-place
+        """
+        rtangle = angle + 90
+        is_parallel = (
+            (df["angle_atan_deg"] > (angle - 45))
+            & (df["angle_atan_deg"] < (angle + 45))
+        ) | (
+            (df["angle_atan_deg"] + 180 > (angle - 45))
+            & (df["angle_atan_deg"] + 180 < (angle + 45))
+        )
+        df["angle"] = math.radians(angle)
+        df["angle"] = df["angle"].where(is_parallel, math.radians(rtangle))
+
+    def align(df):
+        """
+        Align line segments to their nearest orthogonal direction.
+
+        Args:
+            df (pandas.DataFrame): DataFrame with line segment information
+
+        Returns:
+            pandas.DataFrame: DataFrame with aligned line segments
+        """
+        # Handle edge case with empty dataframe
+        if len(df) == 0:
+            return df.copy()
+
+        df_clone = df.copy()
+
+        # Ensure angle column exists and has valid values
+        if "angle" not in df_clone.columns or df_clone["angle"].isna().any():
+            # If angle data is missing, add default angles based on atan2
+            df_clone["angle"] = df_clone["angle_atan"]
+
+        # Ensure length and center point data is valid
+        if "len" not in df_clone.columns or df_clone["len"].isna().any():
+            # Recalculate lengths if missing
+            df_clone["len"] = np.sqrt(
+                (df_clone["x2"] - df_clone["x1"]) ** 2
+                + (df_clone["y2"] - df_clone["y1"]) ** 2
+            )
+
+        if "cx" not in df_clone.columns or df_clone["cx"].isna().any():
+            df_clone["cx"] = (df_clone["x1"] + df_clone["x2"]) / 2.0
+
+        if "cy" not in df_clone.columns or df_clone["cy"].isna().any():
+            df_clone["cy"] = (df_clone["y1"] + df_clone["y2"]) / 2.0
+
+        # Apply orthogonal alignment
+        df_clone["x1"] = df_clone["cx"] - ((df_clone["len"] / 2) * np.cos(df["angle"]))
+        df_clone["x2"] = df_clone["cx"] + ((df_clone["len"] / 2) * np.cos(df["angle"]))
+        df_clone["y1"] = df_clone["cy"] - ((df_clone["len"] / 2) * np.sin(df["angle"]))
+        df_clone["y2"] = df_clone["cy"] + ((df_clone["len"] / 2) * np.sin(df["angle"]))
+
+        return df_clone
+
+    def merge_lines(df_aligned):
+        """
+        Merge collinear line segments.
+
+        Args:
+            df_aligned (pandas.DataFrame): DataFrame with aligned line segments
+
+        Returns:
+            pandas.DataFrame: DataFrame with merged line segments
+        """
+        ortho_lines = []
+        groups = df_aligned.groupby(
+            (df_aligned["angle"].shift() != df_aligned["angle"]).cumsum()
+        )
+        for x, y in groups:
+            group_cx = (y["cx"] * y["len"]).sum() / y["len"].sum()
+            group_cy = (y["cy"] * y["len"]).sum() / y["len"].sum()
+            cumlen = y["len"].sum()
+
+            ortho_lines.append((group_cx, group_cy, cumlen, y["angle"].iloc[0]))
+
+        ortho_list = []
+        for cx, cy, length, rot_angle in ortho_lines:
+            X1 = cx - (length / 2) * math.cos(rot_angle)
+            X2 = cx + (length / 2) * math.cos(rot_angle)
+            Y1 = cy - (length / 2) * math.sin(rot_angle)
+            Y2 = cy + (length / 2) * math.sin(rot_angle)
+
+            ortho_list.append(
+                {
+                    "x1": X1,
+                    "y1": Y1,
+                    "x2": X2,
+                    "y2": Y2,
+                    "len": length,
+                    "cx": cx,
+                    "cy": cy,
+                    "angle": rot_angle,
+                }
+            )
+
+        if (
+            len(ortho_list) > 0 and ortho_list[0]["angle"] == ortho_list[-1]["angle"]
+        ):  # join first and last segment if they're in same direction
+            totlen = ortho_list[0]["len"] + ortho_list[-1]["len"]
+            merge_cx = (
+                (ortho_list[0]["cx"] * ortho_list[0]["len"])
+                + (ortho_list[-1]["cx"] * ortho_list[-1]["len"])
+            ) / totlen
+
+            merge_cy = (
+                (ortho_list[0]["cy"] * ortho_list[0]["len"])
+                + (ortho_list[-1]["cy"] * ortho_list[-1]["len"])
+            ) / totlen
+
+            rot_angle = ortho_list[0]["angle"]
+            X1 = merge_cx - (totlen / 2) * math.cos(rot_angle)
+            X2 = merge_cx + (totlen / 2) * math.cos(rot_angle)
+            Y1 = merge_cy - (totlen / 2) * math.sin(rot_angle)
+            Y2 = merge_cy + (totlen / 2) * math.sin(rot_angle)
+
+            ortho_list[-1] = {
+                "x1": X1,
+                "y1": Y1,
+                "x2": X2,
+                "y2": Y2,
+                "len": totlen,
+                "cx": merge_cx,
+                "cy": merge_cy,
+                "angle": rot_angle,
+            }
+            ortho_list = ortho_list[1:]
+        ortho_df = pd.DataFrame(ortho_list)
+        return ortho_df
+
+    def find_intersection(x1, y1, x2, y2, x3, y3, x4, y4):
+        """
+        Find the intersection point of two line segments.
+
+        Args:
+            x1, y1, x2, y2: Coordinates of the first line segment
+            x3, y3, x4, y4: Coordinates of the second line segment
+
+        Returns:
+            list: [x, y] coordinates of the intersection point
+
+        Raises:
+            ZeroDivisionError: If the lines are parallel or collinear
+        """
+        # Calculate the denominator of the intersection formula
+        denominator = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+
+        # Check if lines are parallel or collinear (denominator close to zero)
+        if abs(denominator) < 1e-10:
+            raise ZeroDivisionError("Lines are parallel or collinear")
+
+        px = (
+            (x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)
+        ) / denominator
+        py = (
+            (x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)
+        ) / denominator
+
+        # Check if the intersection point is within a reasonable distance
+        # from both line segments to avoid extreme extrapolation
+        def point_on_segment(x, y, x1, y1, x2, y2, tolerance=2.0):
+            # Check if point (x,y) is near the line segment from (x1,y1) to (x2,y2)
+            # First check if it's near the infinite line
+            line_len = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            if line_len < 1e-10:
+                return np.sqrt((x - x1) ** 2 + (y - y1) ** 2) <= tolerance
+
+            t = ((x - x1) * (x2 - x1) + (y - y1) * (y2 - y1)) / (line_len**2)
+
+            # Check distance to the infinite line
+            proj_x = x1 + t * (x2 - x1)
+            proj_y = y1 + t * (y2 - y1)
+            dist_to_line = np.sqrt((x - proj_x) ** 2 + (y - proj_y) ** 2)
+
+            # Check if the projection is near the segment, not just the infinite line
+            if t < -tolerance or t > 1 + tolerance:
+                # If far from the segment, compute distance to the nearest endpoint
+                dist_to_start = np.sqrt((x - x1) ** 2 + (y - y1) ** 2)
+                dist_to_end = np.sqrt((x - x2) ** 2 + (y - y2) ** 2)
+                return min(dist_to_start, dist_to_end) <= tolerance * 2
+
+            return dist_to_line <= tolerance
+
+        # Check if intersection is reasonably close to both line segments
+        if not (
+            point_on_segment(px, py, x1, y1, x2, y2)
+            and point_on_segment(px, py, x3, y3, x4, y4)
+        ):
+            # If intersection is far from segments, it's probably extrapolating too much
+            raise ValueError("Intersection point too far from line segments")
+
+        return [px, py]
+
+    def join_ring(merged_df):
+        """
+        Join line segments to form a closed ring.
+
+        Args:
+            merged_df (pandas.DataFrame): DataFrame with merged line segments
+
+        Returns:
+            numpy.ndarray: Array of shape (1, n, 2) containing the ring coordinates
+        """
+        # Handle edge cases
+        if len(merged_df) < 3:
+            # Not enough segments to form a valid polygon
+            return np.array([[]])
+
+        ring = []
+
+        # Find intersections between adjacent line segments
+        for i in range(len(merged_df) - 1):
+            x1, y1, x2, y2, *_ = merged_df.iloc[i]
+            x3, y3, x4, y4, *_ = merged_df.iloc[i + 1]
+
+            try:
+                intersection = find_intersection(x1, y1, x2, y2, x3, y3, x4, y4)
+
+                # Check if the intersection point is too far from either line segment
+                # This helps prevent extending edges beyond reasonable bounds
+                dist_to_seg1 = min(
+                    np.sqrt((intersection[0] - x1) ** 2 + (intersection[1] - y1) ** 2),
+                    np.sqrt((intersection[0] - x2) ** 2 + (intersection[1] - y2) ** 2),
+                )
+                dist_to_seg2 = min(
+                    np.sqrt((intersection[0] - x3) ** 2 + (intersection[1] - y3) ** 2),
+                    np.sqrt((intersection[0] - x4) ** 2 + (intersection[1] - y4) ** 2),
+                )
+
+                # Use the maximum of line segment lengths as a reference
+                max_len = max(
+                    np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2),
+                    np.sqrt((x4 - x3) ** 2 + (y4 - y3) ** 2),
+                )
+
+                # If intersection is too far away, use the endpoint of the first segment instead
+                if dist_to_seg1 > max_len * 0.5 or dist_to_seg2 > max_len * 0.5:
+                    ring.append([x2, y2])
+                else:
+                    ring.append(intersection)
+            except Exception as e:
+                # If intersection calculation fails, use the endpoint of the first segment
+                ring.append([x2, y2])
+
+        # Connect last segment with first segment
+        x1, y1, x2, y2, *_ = merged_df.iloc[-1]
+        x3, y3, x4, y4, *_ = merged_df.iloc[0]
+
+        try:
+            intersection = find_intersection(x1, y1, x2, y2, x3, y3, x4, y4)
+
+            # Check if the intersection point is too far from either line segment
+            dist_to_seg1 = min(
+                np.sqrt((intersection[0] - x1) ** 2 + (intersection[1] - y1) ** 2),
+                np.sqrt((intersection[0] - x2) ** 2 + (intersection[1] - y2) ** 2),
+            )
+            dist_to_seg2 = min(
+                np.sqrt((intersection[0] - x3) ** 2 + (intersection[1] - y3) ** 2),
+                np.sqrt((intersection[0] - x4) ** 2 + (intersection[1] - y4) ** 2),
+            )
+
+            max_len = max(
+                np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2),
+                np.sqrt((x4 - x3) ** 2 + (y4 - y3) ** 2),
+            )
+
+            if dist_to_seg1 > max_len * 0.5 or dist_to_seg2 > max_len * 0.5:
+                ring.append([x2, y2])
+            else:
+                ring.append(intersection)
+        except Exception as e:
+            # If intersection calculation fails, use the endpoint of the last segment
+            ring.append([x2, y2])
+
+        # Ensure the ring is closed
+        if len(ring) > 0 and (ring[0][0] != ring[-1][0] or ring[0][1] != ring[-1][1]):
+            ring.append(ring[0])
+
+        return np.array([ring])
+
+    def rdp(M, epsilon=0, dist=None, algo="iter", return_mask=False):
+        """
+        Simplifies a given array of points using the Ramer-Douglas-Peucker algorithm.
+
+        Args:
+            M (numpy.ndarray): Array of shape (n, d) containing point coordinates
+            epsilon (float, optional): Epsilon value for simplification
+            dist (callable, optional): Distance function
+            algo (str, optional): Algorithm to use ('iter' or 'rec')
+            return_mask (bool, optional): Whether to return a mask instead of the simplified array
+
+        Returns:
+            numpy.ndarray or list: Simplified points or mask
+        """
+        if dist is None:
+            dist = pldist
+
+        if algo == "iter":
+            algo = partial(rdp_iter, return_mask=return_mask)
+        elif algo == "rec":
+            if return_mask:
+                raise NotImplementedError(
+                    'return_mask=True not supported with algo="rec"'
+                )
+            algo = rdp_rec
+
+        if "numpy" in str(type(M)):
+            return algo(M, epsilon, dist)
+
+        return algo(np.array(M), epsilon, dist).tolist()
+
+    def pldist(point, start, end):
+        """
+        Calculates the distance from 'point' to the line given by 'start' and 'end'.
+
+        Args:
+            point (numpy.ndarray): Point coordinates
+            start (numpy.ndarray): Start point of the line
+            end (numpy.ndarray): End point of the line
+
+        Returns:
+            float: Distance from point to line
+        """
+        if np.all(np.equal(start, end)):
+            return np.linalg.norm(point - start)
+
+        # Fix for NumPy 2.0 deprecation warning - handle 2D vectors properly
+        # Instead of using cross product directly, calculate the area of the
+        # parallelogram formed by the vectors and divide by the length of the line
+        line_vec = end - start
+        point_vec = point - start
+
+        # Area of parallelogram = |a|*|b|*sin(θ)
+        # For 2D vectors: |a×b| = |a|*|b|*sin(θ) = determinant([ax, ay], [bx, by])
+        area = abs(line_vec[0] * point_vec[1] - line_vec[1] * point_vec[0])
+
+        # Distance = Area / |line_vec|
+        return area / np.linalg.norm(line_vec)
+
+    def rdp_rec(M, epsilon, dist=pldist):
+        """
+        Recursive implementation of the Ramer-Douglas-Peucker algorithm.
+
+        Args:
+            M (numpy.ndarray): Array of shape (n, d) containing point coordinates
+            epsilon (float): Epsilon value for simplification
+            dist (callable, optional): Distance function
+
+        Returns:
+            numpy.ndarray: Simplified points
+        """
+        dmax = 0.0
+        index = -1
+
+        for i in range(1, M.shape[0]):
+            d = dist(M[i], M[0], M[-1])
+
+            if d > dmax:
+                index = i
+                dmax = d
+
+        if dmax > epsilon:
+            r1 = rdp_rec(M[: index + 1], epsilon, dist)
+            r2 = rdp_rec(M[index:], epsilon, dist)
+
+            return np.vstack((r1[:-1], r2))
+        else:
+            return np.vstack((M[0], M[-1]))
+
+    def _rdp_iter(M, start_index, last_index, epsilon, dist=pldist):
+        """
+        Internal iterative implementation of the Ramer-Douglas-Peucker algorithm.
+
+        Args:
+            M (numpy.ndarray): Array of shape (n, d) containing point coordinates
+            start_index (int): Start index
+            last_index (int): Last index
+            epsilon (float): Epsilon value for simplification
+            dist (callable, optional): Distance function
+
+        Returns:
+            numpy.ndarray: Boolean mask of points to keep
+        """
+        stk = []
+        stk.append([start_index, last_index])
+        global_start_index = start_index
+        indices = np.ones(last_index - start_index + 1, dtype=bool)
+
+        while stk:
+            start_index, last_index = stk.pop()
+
+            dmax = 0.0
+            index = start_index
+
+            for i in range(index + 1, last_index):
+                if indices[i - global_start_index]:
+                    d = dist(M[i], M[start_index], M[last_index])
+                    if d > dmax:
+                        index = i
+                        dmax = d
+
+            if dmax > epsilon:
+                stk.append([start_index, index])
+                stk.append([index, last_index])
+            else:
+                for i in range(start_index + 1, last_index):
+                    indices[i - global_start_index] = False
+
+        return indices
+
+    def rdp_iter(M, epsilon, dist=pldist, return_mask=False):
+        """
+        Iterative implementation of the Ramer-Douglas-Peucker algorithm.
+
+        Args:
+            M (numpy.ndarray): Array of shape (n, d) containing point coordinates
+            epsilon (float): Epsilon value for simplification
+            dist (callable, optional): Distance function
+            return_mask (bool, optional): Whether to return a mask instead of the simplified array
+
+        Returns:
+            numpy.ndarray: Simplified points or boolean mask
+        """
+        mask = _rdp_iter(M, 0, len(M) - 1, epsilon, dist)
+
+        if return_mask:
+            return mask
+
+        return M[mask]
+
+    # Read the raster data
+    with rasterio.open(input_path) as src:
+        # Read the first band (assuming it contains the mask)
+        mask = src.read(1)
+        transform = src.transform
+        crs = src.crs
+
+        # Extract shapes from the raster mask
+        shapes = features.shapes(mask, transform=transform)
+
+        # Convert shapes to GeoJSON features
+        features_list = []
+        for shape, value in shapes:
+            if value > 0:  # Only process non-zero values (actual objects)
+                # Convert GeoJSON geometry to Shapely polygon
+                polygon = Polygon(shape["coordinates"][0])
+
+                # Skip tiny polygons
+                if polygon.area < min_area:
+                    features_list.append(
+                        {
+                            "type": "Feature",
+                            "properties": {"value": int(value)},
+                            "geometry": shape,
+                        }
+                    )
+                    continue
+
+                # Check if shape is triangular and if we want to avoid triangular shapes
+                if detect_triangles:
+                    # Create a simplified version to check number of vertices
+                    simple_polygon = polygon.simplify(epsilon)
+                    if (
+                        len(simple_polygon.exterior.coords) <= 4
+                    ):  # 3 points + closing point
+                        # Likely a triangular shape - skip orthogonalization
+                        features_list.append(
+                            {
+                                "type": "Feature",
+                                "properties": {"value": int(value)},
+                                "geometry": shape,
+                            }
+                        )
+                        continue
+
+                # Process larger, non-triangular polygons
+                try:
+                    # Convert shapely polygon to a ring format for orthogonalization
+                    exterior_ring = list(polygon.exterior.coords)
+                    interior_rings = [
+                        list(interior.coords) for interior in polygon.interiors
+                    ]
+
+                    # Calculate bounding box aspect ratio to help with parameter tuning
+                    minx, miny, maxx, maxy = polygon.bounds
+                    width = maxx - minx
+                    height = maxy - miny
+                    aspect_ratio = max(width, height) / max(1.0, min(width, height))
+
+                    # Determine if this shape is likely to be a building/rectangular object
+                    # Long thin objects might require different treatment
+                    is_rectangular = aspect_ratio < 3.0
+
+                    # Rectangular objects usually need more careful orthogonalization
+                    epsilon_adjusted = epsilon
+                    min_segments_adjusted = min_segments
+
+                    if is_rectangular:
+                        # For rectangular objects, use more conservative epsilon
+                        epsilon_adjusted = epsilon * 0.75
+                        # Ensure we get at least 4 points for a proper rectangle
+                        min_segments_adjusted = max(4, min_segments)
+
+                    # Orthogonalize the exterior and interior rings
+                    orthogonalized_exterior = orthogonalize_ring(
+                        exterior_ring,
+                        epsilon=epsilon_adjusted,
+                        min_segments=min_segments_adjusted,
+                    )
+
+                    orthogonalized_interiors = [
+                        orthogonalize_ring(
+                            ring,
+                            epsilon=epsilon_adjusted,
+                            min_segments=min_segments_adjusted,
+                        )
+                        for ring in interior_rings
+                    ]
+
+                    # Validate the result - calculate area change
+                    original_area = polygon.area
+                    orthogonalized_poly = Polygon(orthogonalized_exterior)
+
+                    if orthogonalized_poly.is_valid:
+                        area_ratio = (
+                            orthogonalized_poly.area / original_area
+                            if original_area > 0
+                            else 0
+                        )
+
+                        # If area changed too much, revert to original
+                        if area_ratio < area_tolerance or area_ratio > (
+                            1.0 / area_tolerance
+                        ):
+                            # Use original polygon instead
+                            geometry = shape
+                        else:
+                            # Create a new geometry with orthogonalized rings
+                            geometry = {
+                                "type": "Polygon",
+                                "coordinates": [orthogonalized_exterior],
+                            }
+
+                            # Add interior rings if they exist
+                            if orthogonalized_interiors:
+                                geometry["coordinates"].extend(
+                                    [ring for ring in orthogonalized_interiors]
+                                )
+                    else:
+                        # If resulting polygon is invalid, use original
+                        geometry = shape
+
+                    # Add the feature to the list
+                    features_list.append(
+                        {
+                            "type": "Feature",
+                            "properties": {"value": int(value)},
+                            "geometry": geometry,
+                        }
+                    )
+                except Exception as e:
+                    # Keep the original shape if orthogonalization fails
+                    features_list.append(
+                        {
+                            "type": "Feature",
+                            "properties": {"value": int(value)},
+                            "geometry": shape,
+                        }
+                    )
+
+        # Create the final GeoJSON structure
+        geojson = {
+            "type": "FeatureCollection",
+            "crs": {"type": "name", "properties": {"name": str(crs)}},
+            "features": features_list,
+        }
+
+        # Convert to GeoDataFrame and set the CRS
+        gdf = gpd.GeoDataFrame.from_features(geojson["features"], crs=crs)
+
+        # Save to file if output_path is provided
+        if output_path:
+            gdf.to_file(output_path)
 
         return gdf
