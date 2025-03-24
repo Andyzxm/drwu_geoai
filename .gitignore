@@ -14,6 +14,8 @@ docs/examples/*.md
 *.xml
 docs/examples/output/
 docs/examples/*.png
+docs/examples/data/
+*.pth
 
 # Distribution / packaging
 .Python

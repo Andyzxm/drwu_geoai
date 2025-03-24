@@ -6,6 +6,7 @@ import math
 import os
 import warnings
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -28,23 +29,10 @@ from rasterio import features
 from rasterio.plot import show
 from rasterio.windows import Window
 from shapely.affinity import rotate
-from shapely.geometry import (
-    MultiPolygon,
-    Polygon,
-    box,
-    mapping,
-    shape,
-)
+from shapely.geometry import MultiPolygon, Polygon, box, mapping, shape
+from torchvision.models.segmentation import deeplabv3_resnet50, fcn_resnet50
 from torchvision.transforms import RandomRotation
 from tqdm import tqdm
-
-
-try:
-    from torchgeo.datasets import RasterDataset, unbind_samples
-except ImportError as e:
-    raise ImportError(
-        "Your torchgeo version is too old. Please upgrade to the latest version using 'pip install -U torchgeo'."
-    )
 
 
 def view_raster(
@@ -60,7 +48,7 @@ def view_raster(
     zoom_to_layer: Optional[bool] = True,
     visible: Optional[bool] = True,
     opacity: Optional[float] = 1.0,
-    array_args: Optional[Dict] = {},
+    array_args: Optional[Dict] = None,
     client_args: Optional[Dict] = {"cors_all": False},
     basemap: Optional[str] = "OpenStreetMap",
     basemap_args: Optional[Dict] = None,
@@ -100,6 +88,9 @@ def view_raster(
 
     if basemap_args is None:
         basemap_args = {}
+
+    if array_args is None:
+        array_args = {}
 
     m = leafmap.Map()
 
@@ -284,6 +275,14 @@ def plot_batch(
     Returns:
         None
     """
+
+    try:
+        from torchgeo.datasets import unbind_samples
+    except ImportError as e:
+        raise ImportError(
+            "Your torchgeo version is too old. Please upgrade to the latest version using 'pip install -U torchgeo'."
+        )
+
     # Get the samples and the number of items in the batch
     samples = unbind_samples(batch.copy())
 
@@ -323,9 +322,7 @@ def plot_batch(
             )
 
 
-def calc_stats(
-    dataset: RasterDataset, divide_by: float = 1.0
-) -> Tuple[np.ndarray, np.ndarray]:
+def calc_stats(dataset, divide_by: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
     """
     Calculate the statistics (mean and std) for the entire dataset.
 
@@ -700,8 +697,8 @@ def view_vector_interactive(
     """
     import folium
     import folium.plugins as plugins
-    from localtileserver import get_folium_tile_layer, TileClient
     from leafmap import cog_tile
+    from localtileserver import TileClient, get_folium_tile_layer
 
     google_tiles = {
         "Roadmap": {
@@ -752,7 +749,10 @@ def view_vector_interactive(
         kwargs["max_zoom"] = 30
 
     if isinstance(vector_data, str):
-        vector_data = gpd.read_file(vector_data)
+        if vector_data.endswith(".parquet"):
+            vector_data = gpd.read_parquet(vector_data)
+        else:
+            vector_data = gpd.read_file(vector_data)
 
     # Check if input is a GeoDataFrame
     if not isinstance(vector_data, gpd.GeoDataFrame):
@@ -800,9 +800,9 @@ def regularization(
     Returns:
         GeoDataFrame or list of shapely Polygons with regularized building footprints
     """
-    from shapely.geometry import Polygon, shape
-    from shapely.affinity import rotate, translate
     from shapely import wkt
+    from shapely.affinity import rotate, translate
+    from shapely.geometry import Polygon, shape
 
     regularized_buildings = []
 
@@ -921,8 +921,8 @@ def hybrid_regularization(building_polygons):
     Returns:
         GeoDataFrame or list of shapely Polygons with regularized building footprints
     """
-    from shapely.geometry import Polygon
     from shapely.affinity import rotate
+    from shapely.geometry import Polygon
 
     # Use minimum_rotated_rectangle instead of oriented_envelope
     try:
@@ -1036,8 +1036,8 @@ def adaptive_regularization(
     Returns:
         GeoDataFrame or list of shapely Polygons with regularized building footprints
     """
-    from shapely.geometry import Polygon
     from shapely.affinity import rotate
+    from shapely.geometry import Polygon
 
     # Analyze the overall dataset to set appropriate parameters
     if is_gdf := isinstance(building_polygons, gpd.GeoDataFrame):
@@ -1988,6 +1988,7 @@ def raster_to_vector(
     simplify_tolerance=None,
     class_values=None,
     attribute_name="class",
+    unique_attribute_value=False,
     output_format="geojson",
     plot_result=False,
 ):
@@ -2002,6 +2003,7 @@ def raster_to_vector(
         simplify_tolerance (float): Tolerance for geometry simplification. None for no simplification.
         class_values (list): Specific pixel values to vectorize. If None, all values > threshold are vectorized.
         attribute_name (str): Name of the attribute field for the class values.
+        unique_attribute_value (bool): Whether to generate unique values for each shape within a class.
         output_format (str): Format for output file - 'geojson', 'shapefile', 'gpkg'.
         plot_result (bool): Whether to plot the resulting polygons overlaid on the raster.
 
@@ -2032,7 +2034,7 @@ def raster_to_vector(
         # Process each class value
         for class_val in class_values:
             mask = masks[class_val]
-
+            shape_count = 1
             # Vectorize the mask
             for geom, value in features.shapes(
                 mask.astype(np.uint8), mask=mask, transform=transform
@@ -2049,7 +2051,14 @@ def raster_to_vector(
                     geom = geom.simplify(simplify_tolerance)
 
                 # Add to features list with class value
-                all_features.append({"geometry": geom, attribute_name: class_val})
+                if unique_attribute_value:
+                    all_features.append(
+                        {"geometry": geom, attribute_name: class_val * shape_count}
+                    )
+                else:
+                    all_features.append({"geometry": geom, attribute_name: class_val})
+
+                shape_count += 1
 
         # Create GeoDataFrame
         if all_features:
@@ -2591,6 +2600,8 @@ def export_geotiff_tiles(
             print(f"\nRaster info for {in_raster}:")
             print(f"  CRS: {src.crs}")
             print(f"  Dimensions: {src.width} x {src.height}")
+            print(f"  Resolution: {src.res}")
+            print(f"  Bands: {src.count}")
             print(f"  Bounds: {src.bounds}")
 
         # Calculate number of tiles
@@ -4272,8 +4283,9 @@ def read_vector(source, layer=None, **kwargs):
         >>> gdf = read_vector("path/to/data.gpkg", layer="layer_name")
     """
 
-    import fiona
     import urllib.parse
+
+    import fiona
 
     # Determine if source is a URL or local file
     parsed_url = urllib.parse.urlparse(source)
@@ -4348,6 +4360,7 @@ def read_raster(source, band=None, masked=True, **kwargs):
         >>> raster = read_raster("path/to/data.tif", masked=False)
     """
     import urllib.parse
+
     from rasterio.errors import RasterioIOError
 
     # Determine if source is a URL or local file
@@ -4442,8 +4455,8 @@ def region_groups(
     Returns:
         Union[Tuple[np.ndarray, pd.DataFrame], Tuple[xr.DataArray, pd.DataFrame]]: Labeled image and properties DataFrame.
     """
-    from skimage import measure
     import scipy.ndimage as ndi
+    from skimage import measure
 
     if isinstance(image, str):
         ds = rxr.open_rasterio(image)
@@ -4480,8 +4493,8 @@ def region_groups(
             "area_bbox",
             "area_convex",
             "area_filled",
-            "major_length",
-            "minor_length",
+            "axis_major_length",
+            "axis_minor_length",
             "eccentricity",
             "diameter_areagth",
             "extent",
@@ -4578,7 +4591,7 @@ def region_groups(
     )
 
     df = pd.DataFrame(props)
-    df["elongation"] = df["major_length"] / df["minor_length"]
+    df["elongation"] = df["axis_major_length"] / df["axis_minor_length"]
 
     dtype = "uint8"
     if num_labels > 255 and num_labels <= 65535:
@@ -4595,9 +4608,29 @@ def region_groups(
         da.values = label_image
         if out_image is not None:
             da.rio.to_raster(out_image, dtype=dtype)
-            if out_vector is not None:
-                tmp_vector = temp_file_path(".gpkg")
-                raster_to_vector(out_image, tmp_vector)
+
+        if out_vector is not None:
+            tmp_raster = None
+            tmp_vector = None
+            try:
+                if out_image is None:
+                    tmp_raster = temp_file_path(".tif")
+                    da.rio.to_raster(tmp_raster, dtype=dtype)
+                    tmp_vector = temp_file_path(".gpkg")
+                    raster_to_vector(
+                        tmp_raster,
+                        tmp_vector,
+                        attribute_name="value",
+                        unique_attribute_value=True,
+                    )
+                else:
+                    tmp_vector = temp_file_path(".gpkg")
+                    raster_to_vector(
+                        out_image,
+                        tmp_vector,
+                        attribute_name="value",
+                        unique_attribute_value=True,
+                    )
                 gdf = gpd.read_file(tmp_vector)
                 gdf["label"] = gdf["value"].astype(int)
                 gdf.drop(columns=["value"], inplace=True)
@@ -4605,6 +4638,15 @@ def region_groups(
                 gdf2.to_file(out_vector)
                 gdf2.sort_values("label", inplace=True)
                 df = gdf2
+            finally:
+                try:
+                    if tmp_raster is not None and os.path.exists(tmp_raster):
+                        os.remove(tmp_raster)
+                    if tmp_vector is not None and os.path.exists(tmp_vector):
+                        os.remove(tmp_vector)
+                except Exception as e:
+                    print(f"Warning: Failed to delete temporary files: {str(e)}")
+
         return da, df
 
 
@@ -5667,11 +5709,14 @@ def orthogonalize(
         crs = src.crs
 
         # Extract shapes from the raster mask
-        shapes = features.shapes(mask, transform=transform)
+        shapes = list(features.shapes(mask, transform=transform))
+
+        # Initialize progress bar
+        print(f"Processing {len(shapes)} features...")
 
         # Convert shapes to GeoJSON features
         features_list = []
-        for shape, value in shapes:
+        for shape, value in tqdm(shapes, desc="Converting features", unit="shape"):
             if value > 0:  # Only process non-zero values (actual objects)
                 # Convert GeoJSON geometry to Shapely polygon
                 polygon = Polygon(shape["coordinates"][0])
@@ -5811,6 +5856,362 @@ def orthogonalize(
 
         # Save to file if output_path is provided
         if output_path:
+            print(f"Saving to {output_path}...")
             gdf.to_file(output_path)
+            print("Done!")
 
         return gdf
+
+
+def inspect_pth_file(pth_path):
+    """
+    Inspect a PyTorch .pth model file to determine its architecture.
+
+    Args:
+        pth_path: Path to the .pth file to inspect
+
+    Returns:
+        Information about the model architecture
+    """
+    # Check if file exists
+    if not os.path.exists(pth_path):
+        print(f"Error: File {pth_path} not found")
+        return
+
+    # Load the checkpoint
+    try:
+        checkpoint = torch.load(pth_path, map_location=torch.device("cpu"))
+        print(f"\n{'='*50}")
+        print(f"Inspecting model file: {pth_path}")
+        print(f"{'='*50}\n")
+
+        # Check if it's a state_dict or a complete model
+        if isinstance(checkpoint, OrderedDict) or isinstance(checkpoint, dict):
+            if "state_dict" in checkpoint:
+                print("Found 'state_dict' key in the checkpoint.")
+                state_dict = checkpoint["state_dict"]
+            elif "model_state_dict" in checkpoint:
+                print("Found 'model_state_dict' key in the checkpoint.")
+                state_dict = checkpoint["model_state_dict"]
+            else:
+                print("Assuming file contains a direct state_dict.")
+                state_dict = checkpoint
+
+            # Print the keys in the checkpoint
+            print("\nCheckpoint contains the following keys:")
+            for key in checkpoint.keys():
+                if isinstance(checkpoint[key], dict):
+                    print(f"- {key} (dictionary with {len(checkpoint[key])} items)")
+                elif isinstance(checkpoint[key], (torch.Tensor, list, tuple)):
+                    print(
+                        f"- {key} (shape/size: {len(checkpoint[key]) if isinstance(checkpoint[key], (list, tuple)) else checkpoint[key].shape})"
+                    )
+                else:
+                    print(f"- {key} ({type(checkpoint[key]).__name__})")
+
+            # Try to infer the model architecture from the state_dict keys
+            print("\nAnalyzing model architecture from state_dict...")
+
+            # Extract layer keys for analysis
+            layer_keys = list(state_dict.keys())
+
+            # Print the first few layer keys to understand naming pattern
+            print("\nFirst 10 layer names in state_dict:")
+            for i, key in enumerate(layer_keys[:10]):
+                shape = state_dict[key].shape
+                print(f"- {key} (shape: {shape})")
+
+            # Look for architecture indicators in the keys
+            architecture_indicators = {
+                "conv": 0,
+                "bn": 0,
+                "layer": 0,
+                "fc": 0,
+                "backbone": 0,
+                "encoder": 0,
+                "decoder": 0,
+                "unet": 0,
+                "resnet": 0,
+                "classifier": 0,
+                "deeplab": 0,
+                "fcn": 0,
+            }
+
+            for key in layer_keys:
+                for indicator in architecture_indicators:
+                    if indicator in key.lower():
+                        architecture_indicators[indicator] += 1
+
+            print("\nArchitecture indicators found in layer names:")
+            for indicator, count in architecture_indicators.items():
+                if count > 0:
+                    print(f"- '{indicator}' appears {count} times")
+
+            # Count total parameters
+            total_params = sum(p.numel() for p in state_dict.values())
+            print(f"\nTotal parameters: {total_params:,}")
+
+            # Try to load the model with different architectures
+            print("\nAttempting to match with common architectures...")
+
+            # Try to identify if it's a segmentation model
+            if any("out" in k or "classifier" in k for k in layer_keys):
+                print("Model appears to be a segmentation model.")
+
+                # Check if it might be a UNet
+                if (
+                    architecture_indicators["encoder"] > 0
+                    and architecture_indicators["decoder"] > 0
+                ):
+                    print(
+                        "Architecture seems to be a UNet-based model with encoder-decoder structure."
+                    )
+                # Check for FCN or DeepLab indicators
+                elif architecture_indicators["fcn"] > 0:
+                    print(
+                        "Architecture seems to be FCN-based (Fully Convolutional Network)."
+                    )
+                elif architecture_indicators["deeplab"] > 0:
+                    print("Architecture seems to be DeepLab-based.")
+                elif architecture_indicators["backbone"] > 0:
+                    print(
+                        "Model has a backbone architecture, likely a modern segmentation model."
+                    )
+
+            # Try to infer output classes from the final layer
+            output_layer_keys = [
+                k for k in layer_keys if "classifier" in k or k.endswith(".out.weight")
+            ]
+            if output_layer_keys:
+                output_shape = state_dict[output_layer_keys[0]].shape
+                if len(output_shape) >= 2:
+                    num_classes = output_shape[0]
+                    print(f"\nModel likely has {num_classes} output classes.")
+
+            print("\nSUMMARY:")
+            print("The model appears to be", end=" ")
+            if architecture_indicators["unet"] > 0:
+                print("a UNet architecture.", end=" ")
+            elif architecture_indicators["fcn"] > 0:
+                print("an FCN architecture.", end=" ")
+            elif architecture_indicators["deeplab"] > 0:
+                print("a DeepLab architecture.", end=" ")
+            elif architecture_indicators["resnet"] > 0:
+                print("ResNet-based.", end=" ")
+            else:
+                print("a custom architecture.", end=" ")
+
+            # Try to load with common models
+            try_common_architectures(state_dict)
+
+        else:
+            print(
+                "The file contains an entire model object rather than just a state dictionary."
+            )
+            # If it's a complete model, we can directly examine its architecture
+            print(checkpoint)
+
+    except Exception as e:
+        print(f"Error loading the model file: {str(e)}")
+
+
+def try_common_architectures(state_dict):
+    """
+    Try to load the state_dict into common architectures to see which one fits.
+
+    Args:
+        state_dict: The model's state dictionary
+    """
+    import torchinfo
+
+    # Test models and their initializations
+    models_to_try = {
+        "FCN-ResNet50": lambda: fcn_resnet50(num_classes=9),
+        "DeepLabV3-ResNet50": lambda: deeplabv3_resnet50(num_classes=9),
+    }
+
+    print("\nTrying to load state_dict into common architectures:")
+
+    for name, model_fn in models_to_try.items():
+        try:
+            model = model_fn()
+            # Sometimes state_dict keys have 'model.' prefix
+            if all(k.startswith("model.") for k in state_dict.keys()):
+                cleaned_state_dict = {k[6:]: v for k, v in state_dict.items()}
+                model.load_state_dict(cleaned_state_dict, strict=False)
+            else:
+                model.load_state_dict(state_dict, strict=False)
+
+            print(
+                f"- {name}: Successfully loaded (may have missing or unexpected keys)"
+            )
+
+            # Generate model summary
+            print(f"\nSummary of {name} architecture:")
+            summary = torchinfo.summary(model, input_size=(1, 3, 224, 224), verbose=0)
+            print(summary)
+
+        except Exception as e:
+            print(f"- {name}: Failed to load - {str(e)}")
+
+
+def mosaic_geotiffs(input_dir, output_file, mask_file=None):
+    """Create a mosaic from all GeoTIFF files as a Cloud Optimized GeoTIFF (COG).
+
+    This function identifies all GeoTIFF files in the specified directory,
+    creates a seamless mosaic with proper handling of nodata values, and saves
+    as a Cloud Optimized GeoTIFF format. If a mask file is provided, the output
+    will be clipped to the extent of the mask.
+
+    Args:
+        input_dir (str): Path to the directory containing GeoTIFF files.
+        output_file (str): Path to the output Cloud Optimized GeoTIFF file.
+        mask_file (str, optional): Path to a mask file to clip the output.
+            If provided, the output will be clipped to the extent of this mask.
+            Defaults to None.
+
+    Returns:
+        bool: True if the mosaic was created successfully, False otherwise.
+
+    Examples:
+        >>> mosaic_geotiffs('naip', 'merged_naip.tif')
+        True
+        >>> mosaic_geotiffs('naip', 'merged_naip.tif', 'boundary.tif')
+        True
+    """
+    import glob
+    from osgeo import gdal
+
+    gdal.UseExceptions()
+    # Get all tif files in the directory
+    tif_files = glob.glob(os.path.join(input_dir, "*.tif"))
+
+    if not tif_files:
+        print("No GeoTIFF files found in the specified directory.")
+        return False
+
+    # Analyze the first input file to determine compression and nodata settings
+    ds = gdal.Open(tif_files[0])
+    if ds is None:
+        print(f"Unable to open {tif_files[0]}")
+        return False
+
+    # Get driver metadata from the first file
+    driver = ds.GetDriver()
+    creation_options = []
+
+    # Check compression type
+    metadata = ds.GetMetadata("IMAGE_STRUCTURE")
+    if "COMPRESSION" in metadata:
+        compression = metadata["COMPRESSION"]
+        creation_options.append(f"COMPRESS={compression}")
+    else:
+        # Default compression if none detected
+        creation_options.append("COMPRESS=LZW")
+
+    # Add COG-specific creation options
+    creation_options.extend(["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512"])
+
+    # Check for nodata value in the first band of the first file
+    band = ds.GetRasterBand(1)
+    has_nodata = band.GetNoDataValue() is not None
+    nodata_value = band.GetNoDataValue() if has_nodata else None
+
+    # Close the dataset
+    ds = None
+
+    # Create a temporary VRT (Virtual Dataset)
+    vrt_path = os.path.join(input_dir, "temp_mosaic.vrt")
+
+    # Build VRT from input files with proper nodata handling
+    vrt_options = gdal.BuildVRTOptions(
+        resampleAlg="nearest",
+        srcNodata=nodata_value if has_nodata else None,
+        VRTNodata=nodata_value if has_nodata else None,
+    )
+    vrt_dataset = gdal.BuildVRT(vrt_path, tif_files, options=vrt_options)
+
+    # Close the VRT dataset to flush it to disk
+    vrt_dataset = None
+
+    # Create temp mosaic
+    temp_mosaic = output_file + ".temp.tif"
+
+    # Convert VRT to GeoTIFF with the same compression as input
+    translate_options = gdal.TranslateOptions(
+        format="GTiff",
+        creationOptions=creation_options,
+        noData=nodata_value if has_nodata else None,
+    )
+    gdal.Translate(temp_mosaic, vrt_path, options=translate_options)
+
+    # Apply mask if provided
+    if mask_file and os.path.exists(mask_file):
+        print(f"Clipping mosaic to mask: {mask_file}")
+
+        # Create a temporary clipped file
+        clipped_mosaic = output_file + ".clipped.tif"
+
+        # Open mask file
+        mask_ds = gdal.Open(mask_file)
+        if mask_ds is None:
+            print(f"Unable to open mask file: {mask_file}")
+            # Continue without clipping
+        else:
+            # Get mask extent
+            mask_geotransform = mask_ds.GetGeoTransform()
+            mask_projection = mask_ds.GetProjection()
+            mask_ulx = mask_geotransform[0]
+            mask_uly = mask_geotransform[3]
+            mask_lrx = mask_ulx + (mask_geotransform[1] * mask_ds.RasterXSize)
+            mask_lry = mask_uly + (mask_geotransform[5] * mask_ds.RasterYSize)
+
+            # Close mask dataset
+            mask_ds = None
+
+            # Use warp options to clip
+            warp_options = gdal.WarpOptions(
+                format="GTiff",
+                outputBounds=[mask_ulx, mask_lry, mask_lrx, mask_uly],
+                dstSRS=mask_projection,
+                creationOptions=creation_options,
+                srcNodata=nodata_value if has_nodata else None,
+                dstNodata=nodata_value if has_nodata else None,
+            )
+
+            # Apply clipping
+            gdal.Warp(clipped_mosaic, temp_mosaic, options=warp_options)
+
+            # Remove the unclipped temp mosaic and use the clipped one
+            os.remove(temp_mosaic)
+            temp_mosaic = clipped_mosaic
+
+    # Create internal overviews for the temp mosaic
+    ds = gdal.Open(temp_mosaic, gdal.GA_Update)
+    overview_list = [2, 4, 8, 16, 32]
+    ds.BuildOverviews("NEAREST", overview_list)
+    ds = None  # Close the dataset to ensure overviews are written
+
+    # Convert the temp mosaic to a proper COG
+    cog_options = gdal.TranslateOptions(
+        format="GTiff",
+        creationOptions=[
+            "TILED=YES",
+            "COPY_SRC_OVERVIEWS=YES",
+            "COMPRESS=DEFLATE",
+            "PREDICTOR=2",
+            "BLOCKXSIZE=512",
+            "BLOCKYSIZE=512",
+        ],
+        noData=nodata_value if has_nodata else None,
+    )
+    gdal.Translate(output_file, temp_mosaic, options=cog_options)
+
+    # Clean up temporary files
+    if os.path.exists(vrt_path):
+        os.remove(vrt_path)
+    if os.path.exists(temp_mosaic):
+        os.remove(temp_mosaic)
+
+    print(f"Cloud Optimized GeoTIFF mosaic created successfully: {output_file}")
+    return True

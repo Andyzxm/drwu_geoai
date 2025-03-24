@@ -1,6 +1,6 @@
 [project]
 name = "geoai-py"
-version = "0.3.5"
+version = "0.4.3"
 dynamic = [
     "dependencies",
 ]
@@ -37,17 +37,14 @@ exclude = ["docs*"]
 dependencies = {file = ["requirements.txt"]}
 
 [project.optional-dependencies]
-download = ["pystac_client", "planetary_computer", "tqdm", "overturemaps"]
-all = [
-    "geoai[download]",
-]
+extra = ["overturemaps"]
 
 [tool.distutils.bdist_wheel]
 universal = true
 
 
 [tool.bumpversion]
-current_version = "0.3.5"
+current_version = "0.4.3"
 commit = true
 tag = true
 
